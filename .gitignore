@@ -5,6 +5,7 @@ __pycache__/
 .Python
 env/
 venv/
+chess-bot-env/
 ENV/
 env.bak/
 venv.bak/
