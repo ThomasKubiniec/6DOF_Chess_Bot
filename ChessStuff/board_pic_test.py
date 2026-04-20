@@ -10,9 +10,9 @@ cam = cv2.VideoCapture(0)
 ret, frame = cam.read()
 
 frame = get_hdr_chessboard(cap= cam,
-                           w_expos= 5, # 7
-                           b_expos= 8, # 9
-                           focus= 0)
+                           w_expos= 7, # 7
+                           b_expos= 9, # 9
+                           focus= 0) # 0
 
 if ret:
     # Save the frame to a file
