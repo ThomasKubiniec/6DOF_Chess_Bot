@@ -5,25 +5,24 @@ Master control loop for the chess-playing robot.
 Press ENTER to trigger a photo capture cycle.
 Press Ctrl+C or type 'halt' to stop.
 
-Folder structure assumed:
-    ChessStuff/
-        board_vision.py         — capture_photo()
-        vision_move_detector.py — detect_move(prev_path, curr_path) -> str | None
-    RobotStuff/
-        RobotControl/
-            path_planning.py    — execute_robot_move(move: str)
-Stockfish integration is called via a subprocess or wrapper defined below.
-
-TODO: Before running, work through all comments marked TODO in this file.
-      They mark every place that needs to be wired up to your actual scripts.
+Folder structure:
+    <repo_root>/
+        main.py                         ← this file
+        ChessStuff/
+            board_vision.py             — get_board_corners(), rectify_board(), detect_pieces()
+            vision_move_detector.py     — get_8x8_board_from_frame(), detect_move_uci()
+            stockfish_interface.py      — configure_engine(), apply_player_move(), get_engine_response()
+        RobotStuff/
+            RobotControl/
+                path_planning.py        — execute_robot_move(move: str)
 """
 
 import sys
 import os
 import threading
-import subprocess
-import importlib
-from datetime import datetime
+import cv2
+import chess
+import chess.engine
 
 # ---------------------------------------------------------------------------
 # Path setup — ensures sibling packages are importable
@@ -34,147 +33,173 @@ sys.path.insert(0, BASE_DIR)
 # ---------------------------------------------------------------------------
 # Import project modules
 # ---------------------------------------------------------------------------
-# TODO: Replace 'capture_photo' with the actual function name inside board_vision.py
-#       that triggers your camera and saves an image.
-from ChessStuff.board_vision         import capture_photo          # -> str (saved image path)
+# vision_move_detector imports board_vision internally — we only need these two functions
+from ChessStuff.vision_move_detector import get_8x8_board_from_frame, detect_move_uci
 
-# TODO: Replace 'detect_move' with the actual function name inside vision_move_detector.py
-#       that compares two images and returns a move string (or None if no move).
-from ChessStuff.vision_move_detector import detect_move            # (prev, curr) -> str | None
+# stockfish_interface helpers
+from ChessStuff.stockfish_interface import configure_engine, apply_player_move, get_engine_response
 
 # TODO: Replace 'execute_robot_move' with the actual function name inside path_planning.py
-#       that takes a move string and physically moves the robot arm.
 from RobotStuff.RobotControl.path_planning import execute_robot_move  # (move: str) -> None
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PHOTO_DIR        = os.path.join(BASE_DIR, "photos")
+# TODO: Replace with the actual path to your Stockfish binary.
+#       Linux/Mac default:  "/usr/bin/stockfish"
+#       Windows example:    r"C:\Users\YourName\Downloads\stockfish\stockfish.exe"
+STOCKFISH_PATH = "/usr/bin/stockfish"
 
-# TODO: Replace this path with the actual path to your Stockfish executable.
-#       e.g. r"C:\Users\YourName\Downloads\stockfish\stockfish-windows-x86-64.exe"
-STOCKFISH_PATH   = r"C:\path\to\stockfish.exe"
+# Strength setting — valid range 1320–3190 ELO
+ENGINE_ELO    = 1500
 
-# TODO: Adjust search depth if needed. Higher = stronger but slower (15 is a solid default).
-STOCKFISH_DEPTH  = 15
+# Seconds Stockfish is allowed to think per move
+THINK_TIME    = 1.0
+
+# Which camera index to use (0 = default webcam)
+CAMERA_INDEX  = 0
 
 # ---------------------------------------------------------------------------
-# State
+# Game state  (module-level so every cycle shares the same objects)
 # ---------------------------------------------------------------------------
-previous_photo_path: str | None = None
-halt_flag = threading.Event()
+board: chess.Board                         = chess.Board()       # tracks full move history
+engine: chess.engine.SimpleEngine | None   = None                # opened once, reused each cycle
+board_before: list[list[str]] | None       = None                # 8×8 FEN grid from previous photo
+halt_flag                                  = threading.Event()
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Startup helpers
 # ---------------------------------------------------------------------------
 
-def timestamped_path() -> str:
-    """Returns a unique file path for each captured photo."""
-    os.makedirs(PHOTO_DIR, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join(PHOTO_DIR, f"board_{stamp}.png")
+def open_camera() -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open camera at index {CAMERA_INDEX}. "
+            "Check CAMERA_INDEX in the config section."
+        )
+    return cap
 
 
-def query_stockfish(move: str) -> str:
+def open_engine() -> chess.engine.SimpleEngine:
+    eng = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+    configure_engine(eng, ENGINE_ELO)
+    return eng
+
+
+def print_board(board_grid: list[list[str]], label: str = "Board state"):
+    """Pretty-print an 8×8 FEN-letter grid with rank/file labels."""
+    print(f"\n  === {label} ===")
+    print("    a b c d e f g h")
+    print("    ---------------")
+    for rank_idx, row in enumerate(board_grid):
+        rank_number = 8 - rank_idx
+        print(f"  {rank_number}| {' '.join(row)}")
+    print()
+
+# ---------------------------------------------------------------------------
+# Core cycle — triggered by pressing ENTER
+# ---------------------------------------------------------------------------
+
+def run_cycle(cap: cv2.VideoCapture):
     """
-    Send a detected player move to Stockfish and get its response move.
-    Uses Stockfish's UCI protocol via subprocess.
-
-    Args:
-        move: The player's move in UCI format, e.g. 'e2e4'
-
-    Returns:
-        Stockfish's best reply in UCI format, e.g. 'e7e5'
+    One full capture → detect → stockfish → robot cycle.
+    Mutates module-level: board_before, board, (engine is read-only here).
     """
-    commands = "\n".join([
-        "uci",
-        "isready",
-        # TODO: This currently only sends the most recent move to Stockfish, which means
-        #       it always evaluates from the starting position + 1 move.
-        #       For a full game, you'll need to track all moves and pass the complete
-        #       move history here, e.g: "position startpos moves e2e4 e7e5 g1f3 ..."
-        f"position startpos moves {move}",
-        f"go depth {STOCKFISH_DEPTH}",
-    ])
+    global board_before, board, engine
 
-    result = subprocess.run(
-        [STOCKFISH_PATH],
-        input=commands,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    # ── Step 1: Capture current frame ────────────────────────────────────────
+    print("\n[1/5] Capturing frame from camera...")
+    ret, frame = cap.read()
+    if not ret:
+        raise RuntimeError("Camera read failed. Check connection and CAMERA_INDEX.")
+    print("      Frame captured OK.")
 
-    for line in reversed(result.stdout.splitlines()):
-        if line.startswith("bestmove"):
-            return line.split()[1]   # e.g. 'e7e5'
+    # ── Step 2: Detect piece locations on the board ───────────────────────────
+    print("[2/5] Detecting piece locations...")
+    board_after, rectified = get_8x8_board_from_frame(frame)
+    print_board(board_after, label="Current board (all pieces)")
 
-    raise RuntimeError(f"Stockfish did not return a best move.\nOutput:\n{result.stdout}")
-
-
-# ---------------------------------------------------------------------------
-# Core cycle — triggered by 'take photo' input
-# ---------------------------------------------------------------------------
-
-def run_cycle():
-    """
-    One full capture-detect-respond-execute cycle.
-    Mutates global previous_photo_path.
-    """
-    global previous_photo_path
-
-    print("\n[1/5] Capturing photo...")
-    # TODO: Check what arguments capture_photo() expects in board_vision.py.
-    #       Currently it is passed a file path to save to. If your function
-    #       handles its own save path internally, remove the argument entirely:
-    #       current_photo_path = capture_photo()
-    current_photo_path = capture_photo(timestamped_path())
-    print(f"      Saved to: {current_photo_path}")
-
-    if previous_photo_path is None:
-        print("[2/5] No previous photo — this is the baseline. Waiting for next trigger.")
-        previous_photo_path = current_photo_path
+    # First cycle — just store baseline, nothing to compare yet
+    if board_before is None:
+        print("      No previous snapshot — storing as baseline.")
+        print("      Make the human's first move on the board, then press ENTER.")
+        board_before = board_after
         return
 
-    print("[2/5] Comparing photos to detect move...")
-    # TODO: Check what detect_move() returns in vision_move_detector.py.
-    #       This assumes it returns a move in UCI format (e.g. 'e2e4') or None.
-    #       If it returns a different format, you may need to convert it before
-    #       passing it to query_stockfish() below.
-    player_move = detect_move(previous_photo_path, current_photo_path)
+    # ── Step 3: Detect the most recent player move ────────────────────────────
+    print("[3/5] Detecting most recent move...")
+    uci_move = detect_move_uci(board_before, board_after)
 
-    if player_move is None:
-        print("      No move detected. Board may not have changed. Skipping cycle.")
+    if uci_move is None:
+        print("      No move detected. Board may not have changed — skipping cycle.")
+        print("      If a move was made, check lighting or template matching threshold.")
         return
 
-    print(f"      Move detected: {player_move}")
-    previous_photo_path = current_photo_path
+    print(f"      Detected player move (UCI): {uci_move}")
 
-    print("[3/5] Querying Stockfish...")
-    stockfish_move = query_stockfish(player_move)
-    print(f"      Stockfish replies: {stockfish_move}")
+    # Convert UCI → SAN so python-chess / stockfish_interface can consume it
+    try:
+        move_obj  = chess.Move.from_uci(uci_move)
+        san_move  = board.san(move_obj)        # needs pre-move board state
+    except (ValueError, chess.InvalidMoveError) as exc:
+        print(f"      [ERROR] UCI move '{uci_move}' is not legal in current position: {exc}")
+        print("      Board state may be out of sync. Resetting baseline and retrying.")
+        board_before = board_after
+        return
 
-    print("[4/5] Executing robot move...")
-    # TODO: Check what execute_robot_move() expects in path_planning.py.
-    #       Currently it is passed the raw UCI move string from Stockfish (e.g. 'e7e5').
-    #       If your function expects a different format (e.g. joint angles, board
-    #       coordinates, or a move object), convert stockfish_move here first.
-    execute_robot_move(stockfish_move)
+    print(f"      Move in SAN notation: {san_move}")
 
-    print("[5/5] Cycle complete. Waiting for next trigger.\n")
+    # Advance our internal python-chess board with the player's move
+    if not apply_player_move(board, san_move):
+        print(f"      [ERROR] apply_player_move() rejected '{san_move}'. Skipping cycle.")
+        board_before = board_after
+        return
 
+    # Update baseline AFTER a confirmed move
+    board_before = board_after
+
+    # Check for game-over after player's move
+    if board.is_game_over():
+        print(f"\n[GAME OVER] Result: {board.result()}")
+        halt_flag.set()
+        return
+
+    # ── Step 4: Query Stockfish for best reply ────────────────────────────────
+    print("[4/5] Querying Stockfish...")
+    stockfish_san = get_engine_response(board, engine)   # also pushes move onto `board`
+    print(f"      Stockfish replies (SAN): {stockfish_san}")
+
+    # Convert Stockfish's reply back to UCI for the robot
+    # get_engine_response() already pushed the move, so we need the last move on the stack
+    stockfish_uci = board.peek().uci()
+    print(f"      Stockfish reply (UCI):   {stockfish_uci}")
+
+    # Check for game-over after engine's move
+    if board.is_game_over():
+        print(f"\n[GAME OVER] Result: {board.result()}")
+
+    # ── Step 5: Send move to robot arm ────────────────────────────────────────
+    print("[5/5] Executing robot move...")
+    # TODO: execute_robot_move receives the UCI string (e.g. 'e7e5').
+    #       If your path_planning.py expects a different format (e.g. board
+    #       coordinates, SAN, or a move object), convert stockfish_uci here first.
+    execute_robot_move(stockfish_uci)
+
+    print("      Cycle complete. Waiting for next trigger.\n")
+    print(f"  Full move history so far: {board.move_stack}\n")
 
 # ---------------------------------------------------------------------------
 # Input listener — runs on a background thread
 # ---------------------------------------------------------------------------
 
-def input_listener():
+def input_listener(cap: cv2.VideoCapture):
     """
     Listens for keyboard input on a background thread.
     ENTER  → triggers a capture cycle
     'halt' → sets halt_flag to stop the main loop
     """
-    print("  Press ENTER to capture a photo and run a cycle.")
+    print("  Press ENTER after each human move to capture and respond.")
     print("  Type 'halt' and press ENTER (or Ctrl+C) to stop.\n")
 
     while not halt_flag.is_set():
@@ -188,24 +213,37 @@ def input_listener():
             halt_flag.set()
             break
 
-        # Any other input (including bare ENTER) triggers a cycle
         try:
-            run_cycle()
-        except Exception as e:
-            print(f"[ERROR] Cycle failed: {e}")
+            run_cycle(cap)
+        except Exception as exc:
+            print(f"[ERROR] Cycle failed: {exc}")
             print("        Ready for next trigger.\n")
-
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
-    print("=" * 50)
-    print("  6DOF Chess Bot — Master Controller")
-    print("=" * 50)
+    global engine
 
-    listener = threading.Thread(target=input_listener, daemon=True)
+    print("=" * 52)
+    print("  6DOF Chess Bot — Master Controller")
+    print("=" * 52)
+
+    # Open camera and engine once; share across all cycles
+    print("Opening camera...")
+    cap = open_camera()
+    print(f"  Camera index {CAMERA_INDEX} opened OK.")
+
+    print(f"Opening Stockfish engine at: {STOCKFISH_PATH}")
+    engine = open_engine()
+    print(f"  Engine opened OK (ELO cap: {ENGINE_ELO}).\n")
+
+    print("New game — standard starting position.")
+    print("Press ENTER once with pieces in starting position to capture the baseline.")
+    print("Then make the first human move and press ENTER again.\n")
+
+    listener = threading.Thread(target=input_listener, args=(cap,), daemon=True)
     listener.start()
 
     try:
@@ -213,8 +251,11 @@ def main():
     except KeyboardInterrupt:
         print("\n[HALT] Ctrl+C received. Shutting down.")
         halt_flag.set()
-
-    print("Goodbye.")
+    finally:
+        cap.release()
+        if engine:
+            engine.quit()
+        print("Camera and engine closed. Goodbye.")
 
 
 if __name__ == "__main__":
