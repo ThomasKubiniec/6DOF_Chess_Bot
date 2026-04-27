@@ -1,20 +1,18 @@
 import sys
 import os
 
-# ================== PATH FIX FOR RUNNING INSIDE ChessStuff/ ==================
-# This allows "from ChessStuff.board_vision import ..." to work even when the script is inside ChessStuff/
+# ================== ROBUST PATH FIX ==================
+# Ensure we can import sibling modules regardless of where the script is run from
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)  # Go up one level to project root
-sys.path.append(parent_dir)
+project_root = os.path.dirname(current_dir)  # Go up to parent of ChessStuff/
+sys.path.insert(0, project_root)  # Add project root so "from ChessStuff.xxx" works
 
-# Diagnostic print (as requested)
 print("=== Vision Move Detector Startup Diagnostics ===")
 print(f"Current working directory: {os.getcwd()}")
 print(f"Script location: {current_dir}")
-print(f"Added to sys.path: {parent_dir}")
-print("Trying to import from ChessStuff.board_vision...")
+print(f"Project root added to sys.path: {project_root}")
 
-# ================== REAL IMPORTS FROM YOUR board_vision.py ==================
+# Now import (this should now work when running main.py from root)
 try:
     from ChessStuff.board_vision import (
         get_board_corners,
@@ -23,10 +21,10 @@ try:
         THRESHOLD,
         CAMERA_INDEX
     )
-    print("✅ Successfully imported from board_vision.py")
+    print("✅ Successfully imported from ChessStuff.board_vision")
 except Exception as e:
     print(f"❌ Import failed: {e}")
-    print("Make sure you are running the script from inside the ChessStuff folder and that board_vision.py exists there.")
+    print("Make sure board_vision.py exists in the ChessStuff/ folder.")
     sys.exit(1)
 
 import cv2
