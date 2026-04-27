@@ -48,7 +48,7 @@ from RobotStuff.RobotControl.path_planning import execute_robot_move  # (move: s
 # TODO: Replace with the actual path to your Stockfish binary.
 #       Linux/Mac default:  "/usr/bin/stockfish"
 #       Windows example:    r"C:\Users\YourName\Downloads\stockfish\stockfish.exe"
-STOCKFISH_PATH = "/usr/bin/stockfish"
+STOCKFISH_PATH = r"C:\Users\tkubi\Documents\Programs\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
 
 # Strength setting — valid range 1320–3190 ELO
 ENGINE_ELO    = 1500
