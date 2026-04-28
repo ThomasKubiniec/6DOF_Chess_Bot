@@ -14,7 +14,7 @@ print(f"Project root added to sys.path: {project_root}")
 
 # Now import (this should now work when running main.py from root)
 try:
-    from ChessStuff.board_vision import (
+    from ChessStuff.board_vision_OLD import (
         get_board_corners,
         rectify_board,
         detect_pieces,
