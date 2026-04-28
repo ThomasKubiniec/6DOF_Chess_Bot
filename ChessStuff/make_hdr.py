@@ -2,13 +2,10 @@ import cv2
 import numpy as np
 import time
 
-def get_hdr_chessboard(cap, w_expos= 7, b_expos= 9, focus= 0):
+def get_hdr_chessboard(cap, w_expos, b_expos, focus):
     """
     Captures two frames with different exposures and blends them using Mertens fusion.
     """
-    w_expos -= 13 
-    b_expos -= 13
-
 
     # 1. Lock Focus
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
