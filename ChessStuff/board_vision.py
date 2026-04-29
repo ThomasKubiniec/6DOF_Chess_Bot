@@ -37,19 +37,39 @@ PIECE_THRESHOLDS = {
     'white_king': 0.68, 'black_king': 0.68,
 }
 
-# Piece templates
-piece_templates = {}
-for filename in os.listdir(TEMPLATES_DIR):
-    if filename.endswith((".png", ".jpg", ".jpeg")):
-        name = os.path.splitext(filename)[0]
-        template_path = os.path.join(TEMPLATES_DIR, filename)
-        template = cv2.imread(template_path, 0)  # load as grayscale
-        if template is not None:
-            piece_templates[name] = template
+# Piece templates - supports subfolder structure:
+# piece_templates/
+#   white_pawn/
+#     white_pawn_01.png
+#     white_pawn_02.png
+#   black_king/
+#     ...
+# Empty folders are OK (no detection for that piece type).
+piece_templates = {}  # dict: piece_name (str) -> list of grayscale template images (np.ndarray)
+if not os.path.isdir(TEMPLATES_DIR):
+    print(f"❌ ERROR: TEMPLATES_DIR does not exist: {TEMPLATES_DIR}")
+else:
+    for piece_name in os.listdir(TEMPLATES_DIR):
+        piece_dir = os.path.join(TEMPLATES_DIR, piece_name)
+        if not os.path.isdir(piece_dir):
+            continue  # ignore any stray files at top level
+        templates_list = []
+        for filename in os.listdir(piece_dir):
+            if filename.endswith((".png", ".jpg", ".jpeg")):
+                template_path = os.path.join(piece_dir, filename)
+                template = cv2.imread(template_path, 0)  # load as grayscale
+                if template is not None:
+                    templates_list.append(template)
+                else:
+                    print(f"Warning: Could not load template {filename} in {piece_name}")
+        if templates_list:
+            piece_templates[piece_name] = templates_list
         else:
-            print(f"Warning: Could not load template {filename}")
+            print(f"ℹ️  No templates found in folder: {piece_name} (empty folder is OK - pieces may be off-board)")
 
-print(f"✅ Loaded {len(piece_templates)} piece templates: {list(piece_templates.keys())}")
+print(f"✅ Loaded templates for {len(piece_templates)} piece types: {list(piece_templates.keys())}")
+total_templates = sum(len(t) for t in piece_templates.values())
+print(f"   Total individual template images loaded: {total_templates}")
 if not piece_templates:
     print("⚠️  WARNING: No templates were loaded from", TEMPLATES_DIR)
 
@@ -105,11 +125,13 @@ def get_board_corners(frame):
     outer_corners = order_points(hull)
 
     # Slightly expand the box so we capture the full outer squares (not just inner corners)
+    # Increase this factor (e.g. 1.15–1.20) if tall pieces (kings/queens) in far corners
+    # are still being clipped after rectification.
     center = outer_corners.mean(axis=0)
     expanded = []
     for pt in outer_corners:
         vec = pt - center
-        expanded.append(center + vec * 1.10)   # 12% expansion — tweak if needed
+        expanded.append(center + vec * 1.15)   # 15% expansion (was 10%)
     outer_corners = np.float32(expanded)
     
     # Draw green box around estimated board area
@@ -121,13 +143,18 @@ def get_board_corners(frame):
     return outer_corners, debug_frame
 
 
-def rectify_board(frame, src_points):
-    """Rectify board with strict error handling."""
+def rectify_board(frame, src_points, output_size=800):
+    """Rectify board with strict error handling.
+    
+    Args:
+        output_size: Desired side length of the rectified square (default 800).
+                     Use larger value (850–900) when capturing templates of tall pieces.
+    """
     if src_points is None or len(src_points) != 4:
         raise ValueError(f"Invalid src_points received: {src_points}")
     
     src_points = np.float32(src_points).reshape(-1, 2)
-    side = 800
+    side = int(output_size)
     dst_points = np.float32([[0, 0], [side, 0], [side, side], [0, side]])
     
     H, mask = cv2.findHomography(src_points, dst_points)
@@ -139,23 +166,28 @@ def rectify_board(frame, src_points):
 
 
 def detect_pieces(rectified, square_size_px):
-    """Improved template matching"""
+    """Improved template matching - now supports multiple templates per piece type
+    (e.g. several photos of white_pawn from different angles/lighting).
+    Uses the highest-confidence match per square across all templates for that piece.
+    Empty board squares or missing piece types remain '.' (normal for captured pieces).
+    """
     gray_rect = cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
     board_state = [['.' for _ in range(8)] for _ in range(8)]
     detections = []
 
-    for name, template in piece_templates.items():
-        if template is None:
+    for name, templates in piece_templates.items():
+        if not templates:
             continue
         thresh = PIECE_THRESHOLDS.get(name, THRESHOLD)
-        res = cv2.matchTemplate(gray_rect, template, cv2.TM_CCOEFF_NORMED)
-        loc = np.where(res >= thresh)
-        for pt in zip(*loc[::-1]):
-            col = int(pt[0] // square_size_px)
-            row = int(pt[1] // square_size_px)
-            if 0 <= row < 8 and 0 <= col < 8:
-                score = float(res[pt[1], pt[0]])
-                detections.append((score, row, col, name))
+        for template in templates:
+            res = cv2.matchTemplate(gray_rect, template, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= thresh)
+            for pt in zip(*loc[::-1]):
+                col = int(pt[0] // square_size_px)
+                row = int(pt[1] // square_size_px)
+                if 0 <= row < 8 and 0 <= col < 8:
+                    score = float(res[pt[1], pt[0]])
+                    detections.append((score, row, col, name))
 
     best_per_square = {}
     for score, row, col, name in detections:
@@ -169,6 +201,45 @@ def detect_pieces(rectified, square_size_px):
     return board_state
 
 
+def draw_piece_labels(rectified, board_state, square_size_px):
+    """Create a labeled view of the rectified board with small text above each piece.
+    Used for visual debugging in both standalone board_vision and the main.py pipeline.
+    """
+    labeled = rectified.copy()
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    thickness = 1
+    text_color = (0, 255, 255)  # bright cyan for visibility on chessboard
+
+    short_names = {
+        'white_pawn': 'wP', 'black_pawn': 'bP',
+        'white_rook': 'wR', 'black_rook': 'bR',
+        'white_knight': 'wN', 'black_knight': 'bN',
+        'white_bishop': 'wB', 'black_bishop': 'bB',
+        'white_queen': 'wQ', 'black_queen': 'bQ',
+        'white_king': 'wK', 'black_king': 'bK',
+    }
+
+    for r in range(8):
+        for c in range(8):
+            name = board_state[r][c]
+            if name != '.':
+                # Center of the square
+                cx = int((c + 0.5) * square_size_px)
+                cy = int((r + 0.5) * square_size_px)
+                # Position text slightly above the piece
+                text_y = max(15, cy - int(square_size_px * 0.38))
+                short = short_names.get(name, name[:2].upper())
+                # Center the text horizontally
+                (tw, th), _ = cv2.getTextSize(short, font, font_scale, thickness)
+                text_x = cx - tw // 2
+                # Draw with slight shadow for readability
+                cv2.putText(labeled, short, (text_x + 1, text_y + 1), font, font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
+                cv2.putText(labeled, short, (text_x, text_y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    return labeled
+
+
 if __name__ == "__main__":
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
@@ -176,7 +247,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print("=== board_vision2.py - Using goodFeaturesToTrack (Experimental) ===")
-    print("Windows: Live Original | HDR Fused | Debug Corners")
+    print("Windows: Live Original | HDR Fused | Debug Corners | Detected Pieces (labels above pieces)")
     print("Press 'q' to quit.")
 
     cv2.namedWindow("Live Original", cv2.WINDOW_NORMAL)
@@ -211,6 +282,12 @@ if __name__ == "__main__":
             square_size_px = side_px / 8.0
 
             board_state = detect_pieces(rectified, square_size_px)
+
+            # Show labeled board with text above each piece (same as pipeline)
+            labeled_board = draw_piece_labels(rectified, board_state, square_size_px)
+            cv2.namedWindow("Detected Pieces", cv2.WINDOW_NORMAL)
+            cv2.imshow("Detected Pieces", labeled_board)
+            cv2.waitKey(1)
 
             print("\nBoard state:")
             for row in board_state:

@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+
+# Virtual environment directories
 env/
 venv/
 chess-bot-env/
@@ -12,3 +14,13 @@ venv.bak/
 *.env
 .DS_Store
 Thumbs.db
+
+# SAM model weights (large binary files)
+sam3.pt
+sam*.pt
+*.pt
+*.pth
+*.bin
+
+# Ultralytics cache
+ultralytics/
