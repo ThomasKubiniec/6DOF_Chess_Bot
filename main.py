@@ -1,261 +1,206 @@
 """
-main.py — 6DOF Chess Bot Orchestrator
---------------------------------------
-Master control loop for the chess-playing robot.
-Press ENTER to trigger a photo capture cycle.
-Press Ctrl+C or type 'halt' to stop.
-
-Folder structure:
-    <repo_root>/
-        main.py                         ← this file
-        ChessStuff/
-            board_vision.py             — get_board_corners(), rectify_board(), detect_pieces()
-            vision_move_detector.py     — get_8x8_board_from_frame(), detect_move_uci()
-            stockfish_interface.py      — configure_engine(), apply_player_move(), get_engine_response()
-        RobotStuff/
-            RobotControl/
-                path_planning.py        — execute_robot_move(move: str)
+main.py — 6DOF Chess Bot (Robust Ctrl+C Fix v2)
+Guaranteed clean shutdown even when OpenCV + threads are involved.
 """
 
 import sys
 import os
 import threading
+import signal
+import time
+import atexit
 import cv2
 import chess
 import chess.engine
 
-# ---------------------------------------------------------------------------
-# Path setup — ensures sibling packages are importable
-# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
-# ---------------------------------------------------------------------------
-# Import project modules
-# ---------------------------------------------------------------------------
-# vision_move_detector imports board_vision internally — we only need these two functions
-from ChessStuff.vision_move_detector import get_8x8_board_from_frame, detect_move_uci
+from ChessStuff.vision_move_detector import (
+    get_8x8_board_from_frame,
+    detect_move_uci,
+    get_good_frame
+)
 
-# stockfish_interface helpers
 from ChessStuff.stockfish_interface import configure_engine, apply_player_move, get_engine_response
+from RobotStuff.RobotControl.path_planning import execute_robot_move
 
-# TODO: Replace 'execute_robot_move' with the actual function name inside path_planning.py
-from RobotStuff.RobotControl.path_planning import execute_robot_move  # (move: str) -> None
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-# TODO: Replace with the actual path to your Stockfish binary.
-#       Linux/Mac default:  "/usr/bin/stockfish"
-#       Windows example:    r"C:\Users\YourName\Downloads\stockfish\stockfish.exe"
 STOCKFISH_PATH = r"C:\Users\tkubi\Documents\Programs\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+ENGINE_ELO = 1500
+CAMERA_INDEX = 0
 
-# Strength setting — valid range 1320–3190 ELO
-ENGINE_ELO    = 1500
+board: chess.Board = chess.Board()
+engine = None
+board_before = None
+halt_flag = threading.Event()
+cap = None
 
-# Seconds Stockfish is allowed to think per move
-THINK_TIME    = 1.0
 
-# Which camera index to use (0 = default webcam)
-CAMERA_INDEX  = 0
+def force_cleanup():
+    """Nuclear but reliable cleanup for OpenCV + Windows."""
+    global cap, engine
+    print("\n[FORCE CLEANUP] Shutting down...")
 
-# ---------------------------------------------------------------------------
-# Game state  (module-level so every cycle shares the same objects)
-# ---------------------------------------------------------------------------
-board: chess.Board                         = chess.Board()       # tracks full move history
-engine: chess.engine.SimpleEngine | None   = None                # opened once, reused each cycle
-board_before: list[list[str]] | None       = None                # 8×8 FEN grid from previous photo
-halt_flag                                  = threading.Event()
+    # 1. Stop camera
+    if cap is not None:
+        try:
+            cap.release()
+        except:
+            pass
 
-# ---------------------------------------------------------------------------
-# Startup helpers
-# ---------------------------------------------------------------------------
+    # 2. Quit engine
+    if engine is not None:
+        try:
+            engine.quit()
+        except:
+            pass
 
-def open_camera() -> cv2.VideoCapture:
+    # 3. Destroy ALL OpenCV windows (do it multiple times - sometimes needed)
+    for _ in range(3):
+        try:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+        except:
+            pass
+
+    time.sleep(0.3)          # Give Windows time to release resources
+    print("[FORCE CLEANUP] Done. Exiting now.")
+    os._exit(0)              # Hard exit - bypasses normal Python shutdown
+
+
+# Register cleanup for all exit paths
+atexit.register(force_cleanup)
+
+
+def signal_handler(sig, frame):
+    print("\n[Ctrl+C] Caught interrupt signal.")
+    halt_flag.set()
+    force_cleanup()
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def open_camera():
+    global cap
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open camera at index {CAMERA_INDEX}. "
-            "Check CAMERA_INDEX in the config section."
-        )
+        raise RuntimeError("Could not open camera")
     return cap
 
 
-def open_engine() -> chess.engine.SimpleEngine:
+def open_engine():
     eng = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
     configure_engine(eng, ENGINE_ELO)
     return eng
 
 
-def print_board(board_grid: list[list[str]], label: str = "Board state"):
-    """Pretty-print an 8×8 FEN-letter grid with rank/file labels."""
+def print_board(board_grid, label="Board state"):
     print(f"\n  === {label} ===")
     print("    a b c d e f g h")
     print("    ---------------")
-    for rank_idx, row in enumerate(board_grid):
-        rank_number = 8 - rank_idx
-        print(f"  {rank_number}| {' '.join(row)}")
+    for i, row in enumerate(board_grid):
+        print(f"  {8-i}| {' '.join(row)}")
     print()
 
-# ---------------------------------------------------------------------------
-# Core cycle — triggered by pressing ENTER
-# ---------------------------------------------------------------------------
 
-def run_cycle(cap: cv2.VideoCapture):
-    """
-    One full capture → detect → stockfish → robot cycle.
-    Mutates module-level: board_before, board, (engine is read-only here).
-    """
+def run_cycle(cap):
     global board_before, board, engine
 
-    # ── Step 1: Capture current frame ────────────────────────────────────────
-    print("\n[1/5] Capturing frame from camera...")
-    ret, frame = cap.read()
-    if not ret:
-        raise RuntimeError("Camera read failed. Check connection and CAMERA_INDEX.")
-    print("      Frame captured OK.")
+    print("\n[1/5] Capturing HDR + cropped frame...")
+    frame = get_good_frame(cap)
+    if frame is None:
+        return
+    print("      Frame ready.")
 
-    # ── Step 2: Detect piece locations on the board ───────────────────────────
-    print("[2/5] Detecting piece locations...")
-    board_after, rectified = get_8x8_board_from_frame(frame)
-    print_board(board_after, label="Current board (all pieces)")
+    print("[2/5] Detecting pieces...")
+    board_after, rectified, debug_frame = get_8x8_board_from_frame(frame)
 
-    # First cycle — just store baseline, nothing to compare yet
+    cv2.namedWindow("Debug Corners", cv2.WINDOW_NORMAL)
+    cv2.imshow("Debug Corners", debug_frame)
+    cv2.waitKey(1)
+
+    print_board(board_after, "Current board")
+
     if board_before is None:
-        print("      No previous snapshot — storing as baseline.")
-        print("      Make the human's first move on the board, then press ENTER.")
+        print("      Baseline stored. Make your move and press ENTER.")
         board_before = board_after
         return
 
-    # ── Step 3: Detect the most recent player move ────────────────────────────
-    print("[3/5] Detecting most recent move...")
+    print("[3/5] Detecting move...")
     uci_move = detect_move_uci(board_before, board_after)
-
     if uci_move is None:
-        print("      No move detected. Board may not have changed — skipping cycle.")
-        print("      If a move was made, check lighting or template matching threshold.")
+        print("      No move detected.")
         return
+    print(f"      Move: {uci_move}")
 
-    print(f"      Detected player move (UCI): {uci_move}")
-
-    # Convert UCI → SAN so python-chess / stockfish_interface can consume it
     try:
-        move_obj  = chess.Move.from_uci(uci_move)
-        san_move  = board.san(move_obj)        # needs pre-move board state
-    except (ValueError, chess.InvalidMoveError) as exc:
-        print(f"      [ERROR] UCI move '{uci_move}' is not legal in current position: {exc}")
-        print("      Board state may be out of sync. Resetting baseline and retrying.")
+        move_obj = chess.Move.from_uci(uci_move)
+        san_move = board.san(move_obj)
+    except Exception as e:
+        print(f"      Invalid move: {e}")
         board_before = board_after
         return
 
-    print(f"      Move in SAN notation: {san_move}")
-
-    # Advance our internal python-chess board with the player's move
     if not apply_player_move(board, san_move):
-        print(f"      [ERROR] apply_player_move() rejected '{san_move}'. Skipping cycle.")
         board_before = board_after
         return
 
-    # Update baseline AFTER a confirmed move
     board_before = board_after
 
-    # Check for game-over after player's move
     if board.is_game_over():
-        print(f"\n[GAME OVER] Result: {board.result()}")
+        print(f"\n[GAME OVER] {board.result()}")
         halt_flag.set()
         return
 
-    # ── Step 4: Query Stockfish for best reply ────────────────────────────────
-    print("[4/5] Querying Stockfish...")
-    stockfish_san = get_engine_response(board, engine)   # also pushes move onto `board`
-    print(f"      Stockfish replies (SAN): {stockfish_san}")
-
-    # Convert Stockfish's reply back to UCI for the robot
-    # get_engine_response() already pushed the move, so we need the last move on the stack
+    print("[4/5] Stockfish thinking...")
+    stockfish_san = get_engine_response(board, engine)
     stockfish_uci = board.peek().uci()
-    print(f"      Stockfish reply (UCI):   {stockfish_uci}")
+    print(f"      Stockfish: {stockfish_san} ({stockfish_uci})")
 
-    # Check for game-over after engine's move
-    if board.is_game_over():
-        print(f"\n[GAME OVER] Result: {board.result()}")
-
-    # ── Step 5: Send move to robot arm ────────────────────────────────────────
-    print("[5/5] Executing robot move...")
-    # TODO: execute_robot_move receives the UCI string (e.g. 'e7e5').
-    #       If your path_planning.py expects a different format (e.g. board
-    #       coordinates, SAN, or a move object), convert stockfish_uci here first.
+    print("[5/5] Sending move to robot...")
     execute_robot_move(stockfish_uci)
+    print("      Cycle complete.\n")
 
-    print("      Cycle complete. Waiting for next trigger.\n")
-    print(f"  Full move history so far: {board.move_stack}\n")
 
-# ---------------------------------------------------------------------------
-# Input listener — runs on a background thread
-# ---------------------------------------------------------------------------
-
-def input_listener(cap: cv2.VideoCapture):
-    """
-    Listens for keyboard input on a background thread.
-    ENTER  → triggers a capture cycle
-    'halt' → sets halt_flag to stop the main loop
-    """
-    print("  Press ENTER after each human move to capture and respond.")
-    print("  Type 'halt' and press ENTER (or Ctrl+C) to stop.\n")
-
+def input_listener(cap):
+    print("Press ENTER after each human move. Type 'halt' to stop.\n")
     while not halt_flag.is_set():
         try:
             user_input = input()
         except EOFError:
             break
-
         if user_input.strip().lower() == "halt":
-            print("[HALT] Stop requested via input.")
             halt_flag.set()
             break
-
         try:
             run_cycle(cap)
-        except Exception as exc:
-            print(f"[ERROR] Cycle failed: {exc}")
-            print("        Ready for next trigger.\n")
+        except Exception as e:
+            print(f"[ERROR] {e}")
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main():
-    global engine
+    global engine, cap
 
     print("=" * 52)
-    print("  6DOF Chess Bot — Master Controller")
+    print("  6DOF Chess Bot — Master Controller (Robust Shutdown)")
     print("=" * 52)
 
-    # Open camera and engine once; share across all cycles
-    print("Opening camera...")
     cap = open_camera()
-    print(f"  Camera index {CAMERA_INDEX} opened OK.")
-
-    print(f"Opening Stockfish engine at: {STOCKFISH_PATH}")
     engine = open_engine()
-    print(f"  Engine opened OK (ELO cap: {ENGINE_ELO}).\n")
 
-    print("New game — standard starting position.")
-    print("Press ENTER once with pieces in starting position to capture the baseline.")
-    print("Then make the first human move and press ENTER again.\n")
+    print("Camera and Stockfish ready.\n")
+    print("Press ENTER with starting position to begin.\n")
 
-    listener = threading.Thread(target=input_listener, args=(cap,), daemon=True)
+    listener = threading.Thread(target=input_listener, args=(cap,), daemon=False)
     listener.start()
 
     try:
-        halt_flag.wait()          # Block main thread until halt is requested
+        halt_flag.wait()
     except KeyboardInterrupt:
-        print("\n[HALT] Ctrl+C received. Shutting down.")
-        halt_flag.set()
+        pass
     finally:
-        cap.release()
-        if engine:
-            engine.quit()
-        print("Camera and engine closed. Goodbye.")
+        force_cleanup()
 
 
 if __name__ == "__main__":
