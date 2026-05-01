@@ -82,14 +82,10 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 def get_good_frame(cap):
     """Capture HDR-fused + margin-cropped frame (reuses project logic)."""
     if get_hdr_chessboard is not None:
-        frame = get_hdr_chessboard(cap, w_expos=-5, b_expos=-5, focus=35)
+        frame = get_hdr_chessboard(cap, w_expos=-10, b_expos=-5, focus=0)
         if frame is None:
-            ret, frame = cap.read()
-    else:
-        ret, frame = cap.read()
-
-    if frame is None:
-        return None
+            print("Failed to capture frame.")
+            return None
 
     h, w = frame.shape[:2]
     frame = frame[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
@@ -99,8 +95,8 @@ def get_good_frame(cap):
 def main():
     print("\n=== INSTRUCTIONS ===")
     print("• Live window shows fast camera preview")
-    print("• Press 'c' to capture an HDR + rectified snapshot")
-    print("• In the rectified window: click and drag a tight box around ONE piece")
+    print("• Press 'c' to capture an HDR + rectified snapshot (now uses EXACT same rectification as live detection)")
+    print("• In the rectified window: click and drag a tight box around ONE piece (include full height of tall pieces)")
     print("• Press ENTER or SPACE to accept the crop")
     print("• Type a name like 'white_pawn_05' or 'black_knight_02' and press ENTER")
     print("• Repeat for as many variants as you want (aim for 8–12 per piece type)")
@@ -126,8 +122,8 @@ def main():
         live = live[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
 
         # Overlay instructions
-        cv2.putText(live, "Press 'c' = capture HDR + rectified (tall pieces now fully visible)", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(live, "Press 'c' = capture HDR + rectified (standard pipeline, tall pieces now fully visible)", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
         cv2.putText(live, "Press 'q' = quit", (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.imshow("Live Preview - Press 'c' to capture | 'q' to quit", live)
@@ -142,22 +138,19 @@ def main():
                 print("  ❌ Failed to get good frame — using live frame instead")
                 good_frame = live.copy()
 
-            # Rectify with EXTRA expansion + slightly larger canvas so tall corner pieces
-            # (kings/queens) are fully visible for template capture.
+            # Rectify using the exact same pipeline as live detection (consistent scale + tall-piece margin)
             try:
                 src_points, debug = get_board_corners(good_frame)
 
-                # More aggressive expansion just for template capture (main detection still uses 1.15)
-                center = src_points.mean(axis=0)
-                expanded = [center + (pt - center) * 1.18 for pt in src_points]
-                src_points_exp = np.float32(expanded)
-
-                # Use 880 px output (10% larger than 800) → gives breathing room for tall pieces
-                rectified, H, side_px = rectify_board(good_frame, src_points_exp, output_size=880)
-                print(f"  ✅ Board rectified ({side_px}x{side_px} px) — extra room for tall pieces")
+                # Use EXACT same src_points and output_size as live detection (board_vision.py)
+                # This guarantees templates are captured at the precise scale/alignment used by
+                # detect_pieces() → perfect template matching with no scale mismatch.
+                # (The 1.25 expansion now in get_board_corners gives plenty of margin for tall pieces.)
+                rectified, H, side_px = rectify_board(good_frame, src_points, output_size=800)
+                print(f"  ✅ Board rectified ({side_px}x{side_px} px) — using standard detection pipeline")
 
                 # Show rectified board and let user select the piece
-                select_win = "Rectified Board — Drag tight box around ONE piece (tall pieces fully visible)"
+                select_win = "Rectified Board (standard detection view) — Drag tight box around ONE piece"
                 cv2.namedWindow(select_win, cv2.WINDOW_NORMAL)
                 cv2.imshow(select_win, rectified)
 

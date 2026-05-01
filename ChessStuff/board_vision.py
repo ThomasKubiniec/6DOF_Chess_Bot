@@ -33,14 +33,25 @@ CROP_RIGHT_PX = 80
 # Tune 0.88–0.96: lower = excludes more wood (safer from false positives), higher = includes more of outer squares.
 BOARD_SHRINK_FACTOR = 0.92
 
+# === Separate HDR exposure settings for board corners vs piece detection ===
+# Tune these independently:
+# - BOARD exposures: optimize for clear corner detection / board edges (often darker or higher contrast)
+# - PIECES exposures: optimize for piece visibility, color/contrast on the actual chess pieces
+# get_hdr_chessboard already fuses two exposures (w_expos + b_expos) internally — we just call it twice with different pairs.
+HDR_BOARD_W_EXPOS = -5
+HDR_BOARD_B_EXPOS = -5
+HDR_PIECES_W_EXPOS = -10
+HDR_PIECES_B_EXPOS = -5
+HDR_FOCUS = 0
+
 # Per-piece thresholds (tune these based on your templates and lighting)
 PIECE_THRESHOLDS = {
     'white_pawn': 0.78, 'black_pawn': 0.78,
     'white_rook': 0.75, 'black_rook': 0.75,
-    'white_knight': 0.72, 'black_knight': 0.72,
+    'white_knight': 0.76, 'black_knight': 0.72,
     'white_bishop': 0.74, 'black_bishop': 0.74,
-    'white_queen': 0.72, 'black_queen': 0.72,
-    'white_king': 0.68, 'black_king': 0.68,
+    'white_queen': 0.74, 'black_queen': 0.72,
+    'white_king': 0.70, 'black_king': 0.68,
     'empty_square': 0.75,
 }
 
@@ -80,6 +91,12 @@ print(f"   Total individual template images loaded: {total_templates}")
 if not piece_templates:
     print("⚠️  WARNING: No templates were loaded from", TEMPLATES_DIR)
 
+print(f"\n📸 Separate HDR captures enabled:")
+print(f"   Board corners: w_expos={HDR_BOARD_W_EXPOS}, b_expos={HDR_BOARD_B_EXPOS}")
+print(f"   Pieces:        w_expos={HDR_PIECES_W_EXPOS}, b_expos={HDR_PIECES_B_EXPOS}")
+print(f"   (Tune the HDR_* constants at top of file for your lighting/setup)\n")
+
+
 def get_board_corners(frame):
     """Detect board corners using cv2.goodFeaturesToTrack instead of findChessboardCorners.
     This is experimental and may not be as reliable as chessboard-specific detection."""
@@ -95,9 +112,9 @@ def get_board_corners(frame):
     # === Use goodFeaturesToTrack to find corners ===
     corners = cv2.goodFeaturesToTrack(
         gray,
-        maxCorners=120,
-        qualityLevel=0.13,
-        minDistance=40,
+        maxCorners=85,
+        qualityLevel=0.15,
+        minDistance=45,
         blockSize=7
     )
     
@@ -138,7 +155,7 @@ def get_board_corners(frame):
     expanded = []
     for pt in outer_corners:
         vec = pt - center
-        expanded.append(center + vec * 1.12)   # reduced from 1.15 to help exclude border
+        expanded.append(center + vec * 1.22)   # reduced from 1.15 to help exclude border
     outer_corners = np.float32(expanded)
 
     # === KEY FIX: Shrink inward from the (expanded) corners to exclude the wooden outer border ===
@@ -266,8 +283,8 @@ if __name__ == "__main__":
         print("ERROR: Could not open camera!")
         sys.exit(1)
 
-    print("=== board_vision2.py - Using goodFeaturesToTrack (Experimental) ===")
-    print("Windows: Live Original | HDR Fused | Debug Corners | Detected Pieces (labels above pieces)")
+    print("=== board_vision.py — Separate HDR for Board vs Pieces (goodFeaturesToTrack) ===")
+    print("Windows: Live Original | HDR Fused (pieces-optimized) | Debug Corners (board-optimized) | Detected Pieces")
     print("Press 'q' to quit.")
 
     cv2.namedWindow("Live Original", cv2.WINDOW_NORMAL)
@@ -275,30 +292,28 @@ if __name__ == "__main__":
     cv2.namedWindow("Debug Corners", cv2.WINDOW_NORMAL)
 
     while True:
-        # Capture HDR frame
+        # Capture TWO separate HDR frames:
+        #   hdr_board  → optimized for get_board_corners (clear edges/corners)
+        #   hdr_pieces → optimized for detect_pieces (best piece visibility/contrast)
         if get_hdr_chessboard is not None:
-            hdr_frame = get_hdr_chessboard(cap, w_expos=-5, b_expos=-5, focus=35)
-            if hdr_frame is None:
-                ret, frame = cap.read()
-                hdr_frame = frame
-        else:
-            ret, hdr_frame = cap.read()
-            frame = hdr_frame
-
-        if hdr_frame is None:
+            hdr_board = get_hdr_chessboard(cap, w_expos=HDR_BOARD_W_EXPOS, b_expos=HDR_BOARD_B_EXPOS, focus=HDR_FOCUS)
+            hdr_pieces = get_hdr_chessboard(cap, w_expos=HDR_PIECES_W_EXPOS, b_expos=HDR_PIECES_B_EXPOS, focus=HDR_FOCUS)
+        if hdr_board is None or hdr_pieces is None:
             print("Failed to capture frame.")
             break
 
         # === Crop left and right sides to eliminate fringe false positives ===
-        h, w = hdr_frame.shape[:2]
-        hdr_frame = hdr_frame[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
-        if 'frame' in locals() and frame is not None:
-            frame = frame[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
+        h, w = hdr_board.shape[:2]
+        hdr_board = hdr_board[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
+        hdr_pieces = hdr_pieces[:, CROP_LEFT_PX : w - CROP_RIGHT_PX].copy()
 
         try:
-            src_points, debug_frame = get_board_corners(hdr_frame)
+            # Use board-optimized frame ONLY for corner detection
+            src_points, debug_frame = get_board_corners(hdr_board)
 
-            rectified, H, side_px = rectify_board(hdr_frame, src_points)
+            # Rectify the pieces-optimized frame using the homography computed from board corners
+            # (homography is the same because camera/board position is fixed between the two quick captures)
+            rectified, H, side_px = rectify_board(hdr_pieces, src_points)
             square_size_px = side_px / 8.0
 
             board_state = detect_pieces(rectified, square_size_px)
@@ -313,14 +328,15 @@ if __name__ == "__main__":
             for row in board_state:
                 print(" ".join(f"{piece:12}" for piece in row))
 
-            cv2.imshow("Live Original", frame if 'frame' in locals() else hdr_frame)
-            cv2.imshow("HDR Fused", hdr_frame)
+            # Show the pieces-optimized HDR as the main "HDR Fused" view (best for seeing pieces)
+            cv2.imshow("Live Original", hdr_pieces)
+            cv2.imshow("HDR Fused", hdr_pieces)
             cv2.imshow("Debug Corners", debug_frame)
 
         except RuntimeError as e:
             print(f"❌ {e}")
-            cv2.imshow("Live Original", frame if 'frame' in locals() else hdr_frame)
-            cv2.imshow("HDR Fused", hdr_frame)
+            cv2.imshow("Live Original", hdr_pieces)
+            cv2.imshow("HDR Fused", hdr_pieces)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break

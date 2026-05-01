@@ -20,8 +20,8 @@ while True:
     
 
     frame = get_hdr_chessboard(cap= cam, 
-                               w_expos= 7,
-                               b_expos= 9,
+                               w_expos= -9,
+                               b_expos= -4,
                                focus= 0)
 
 
