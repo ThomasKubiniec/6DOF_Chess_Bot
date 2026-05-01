@@ -20,7 +20,7 @@ def get_hdr_chessboard(cap, w_expos, b_expos, focus):
         cap.set(cv2.CAP_PROP_EXPOSURE, exp_val)
         # Flush the buffer: Webcams often have 3-5 frames 
         # already queued with old exposure settings.
-        for _ in range(5):
+        for _ in range(10):   #5
             cap.grab()
         ret, frame = cap.read()
         return ret, frame
