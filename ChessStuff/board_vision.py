@@ -27,14 +27,21 @@ CAMERA_INDEX = 0
 CROP_LEFT_PX = 100
 CROP_RIGHT_PX = 80
 
+# === Board area shrink to exclude wooden outer border ===
+# This is the key fix for false positives "off the board".
+# The green box in "Debug Corners" will now tightly fit the checkered playing area only.
+# Tune 0.88–0.96: lower = excludes more wood (safer from false positives), higher = includes more of outer squares.
+BOARD_SHRINK_FACTOR = 0.92
+
 # Per-piece thresholds (tune these based on your templates and lighting)
 PIECE_THRESHOLDS = {
     'white_pawn': 0.78, 'black_pawn': 0.78,
     'white_rook': 0.75, 'black_rook': 0.75,
     'white_knight': 0.72, 'black_knight': 0.72,
     'white_bishop': 0.74, 'black_bishop': 0.74,
-    'white_queen': 0.70, 'black_queen': 0.70,
+    'white_queen': 0.72, 'black_queen': 0.72,
     'white_king': 0.68, 'black_king': 0.68,
+    'empty_square': 0.75,
 }
 
 # Piece templates - supports subfolder structure:
@@ -125,16 +132,26 @@ def get_board_corners(frame):
     outer_corners = order_points(hull)
 
     # Slightly expand the box so we capture the full outer squares (not just inner corners)
-    # Increase this factor (e.g. 1.15–1.20) if tall pieces (kings/queens) in far corners
+    # Increase this factor (e.g. 1.10–1.15) if tall pieces (kings/queens) in far corners
     # are still being clipped after rectification.
     center = outer_corners.mean(axis=0)
     expanded = []
     for pt in outer_corners:
         vec = pt - center
-        expanded.append(center + vec * 1.15)   # 15% expansion (was 10%)
+        expanded.append(center + vec * 1.12)   # reduced from 1.15 to help exclude border
     outer_corners = np.float32(expanded)
+
+    # === KEY FIX: Shrink inward from the (expanded) corners to exclude the wooden outer border ===
+    # This prevents template matching from seeing/ matching anything "off the board".
+    # The green debug box will now tightly enclose only the 8x8 checkered area.
+    center = outer_corners.mean(axis=0)  # recompute after expansion
+    shrunk = []
+    for pt in outer_corners:
+        vec = pt - center
+        shrunk.append(center + vec * BOARD_SHRINK_FACTOR)
+    outer_corners = np.float32(shrunk)
     
-    # Draw green box around estimated board area
+    # Draw green box around estimated board area (now tightened to exclude wood)
     cv2.polylines(debug_frame, [outer_corners.astype(int).reshape((-1,1,2))], 
                   isClosed=True, color=(0, 255, 0), thickness=4)
     
@@ -196,7 +213,10 @@ def detect_pieces(rectified, square_size_px):
             best_per_square[key] = (score, name)
 
     for (row, col), (score, name) in best_per_square.items():
-        board_state[row][col] = name
+        if name == 'empty_square':
+            board_state[row][col] = '.'
+        else:
+            board_state[row][col] = name
 
     return board_state
 
