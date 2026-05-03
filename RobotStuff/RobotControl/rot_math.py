@@ -1,61 +1,72 @@
 """
-Sources:
-https://zhouyisjtu.github.io/project_rotation/cvpr_poster.pdf
-
-https://openreview.net/pdf?id=RFjhxXrTlX#:~:text=The%20so%2Dcalled%20'6D%20representation,large%20gradients%20that%20destabilize%20training.&text=f!&text=Matrix%20'(!
-
-
-Converting SO3 R (3x3) (9D), to 6D and back to save input neurons 
-
-
-SO3_R = 
-[[a1].T, [a2].T, [a3].T]
-
-g_GS(SO3_R) = [[a1].T, [a2].T] (6D_R) (Stiefel Manifold)
-
-f_GS(6D_R) = [[b1].T, [b2].T, [b3].T] (Grant Schmidt Re-orthogonalization)
-b1 = N(a1)
-b2 = N(a2 - (b1 @ a2) * b1) # b1 dot a2
-b3 = b1 X b2 (cross product)
-
-N(v) = v / norm(v) # Normalization
+Rotation math utilities - pure PyTorch implementation.
+Covers SO3 rotation matrices, 6D rotation representation, and Euler angle constructors.
 """
-
-import numpy as np
 import torch
-
-def N(v):
-    """Normalization a vector v"""
-    return v / torch.linalg.norm(v)
+import math
 
 
-def g_GS(SO3_R):
+def Rx_SO3(theta_x_deg: float) -> torch.Tensor:
+    """Rotation matrix about the X axis."""
+    t = math.radians(theta_x_deg)
+    c, s = math.cos(t), math.sin(t)
+    return torch.tensor([
+        [1,  0,  0],
+        [0,  c, -s],
+        [0,  s,  c],
+    ], dtype=torch.float64)
+
+
+def Ry_SO3(theta_y_deg: float) -> torch.Tensor:
+    """Rotation matrix about the Y axis."""
+    t = math.radians(theta_y_deg)
+    c, s = math.cos(t), math.sin(t)
+    return torch.tensor([
+        [ c,  0,  s],
+        [ 0,  1,  0],
+        [-s,  0,  c],
+    ], dtype=torch.float64)
+
+
+def Rz_SO3(theta_z_deg: float) -> torch.Tensor:
+    """Rotation matrix about the Z axis."""
+    t = math.radians(theta_z_deg)
+    c, s = math.cos(t), math.sin(t)
+    return torch.tensor([
+        [c, -s,  0],
+        [s,  c,  0],
+        [0,  0,  1],
+    ], dtype=torch.float64)
+
+
+def YPR_SO3(yaw_deg: float, pitch_deg: float, roll_deg: float) -> torch.Tensor:
     """
-    Convert a 3x3 rotation matrix to a 6D representation
-    by extracting the first two columns.
-    Saves space for input neurons while providing continuous manifold and minimal loss of info
+    Yaw-Pitch-Roll (ZYX) rotation: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
     """
-    a1 = SO3_R[:, 0] # first column
-    a2 = SO3_R[:, 1] # second column
-
-    # _6D_R = np.column_stack((a1, a2))
-    
-    # flatten into a 1D array
-    _6D_R_vect = torch.tensor(np.concatenate((a1, a2)))
-    return _6D_R_vect
+    return Rz_SO3(yaw_deg) @ Ry_SO3(pitch_deg) @ Rx_SO3(roll_deg)
 
 
-def f_GS(_6D_R_vect):
+def to_6D_R(R: torch.Tensor) -> torch.Tensor:
     """
-    Convert a flattend 6D representation of SO3 3x3 rotation matrix
-    back to SO3 3x3 R by Grant-Schmidt-like-orthogonalization
+    Convert a 3x3 SO3 rotation matrix to the 6D representation
+    (first two columns of R, flattened): shape (6,)
     """
-    a1 = _6D_R_vect[:3]
-    a2 = _6D_R_vect[3:]
-    
-    b1 = N(a1)
-    b2 = N(a2 - (b1 @ a2) * b1)
-    b3 = torch.cross(b1, b2)
+    R = R.to(torch.float64)
+    return torch.cat([R[:, 0], R[:, 1]])  # (6,)
 
-    SO3_R = torch.column_stack((b1, b2, b3))
-    return SO3_R
+
+def to_SO3(r6d: torch.Tensor) -> torch.Tensor:
+    """
+    Recover a 3x3 SO3 rotation matrix from a 6D representation.
+    Uses Gram-Schmidt orthonormalisation on the two stored columns.
+    """
+    r6d = r6d.to(torch.float64)
+    a1 = r6d[:3]
+    a2 = r6d[3:6]
+
+    b1 = a1 / torch.linalg.vector_norm(a1)
+    b2 = a2 - torch.dot(b1, a2) * b1
+    b2 = b2 / torch.linalg.vector_norm(b2)
+    b3 = torch.linalg.cross(b1, b2)
+
+    return torch.stack([b1, b2, b3], dim=1)  # (3, 3)
