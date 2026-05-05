@@ -195,28 +195,34 @@ class Oracle:
         self.reset_vars()
         
 
+        # q_vect_trajectory stores (result, q_abs) pairs so the visualiser
+        # always has the correct absolute pose without re-deriving it from deltas.
         q_vect_trajectory = []
 
         trajectory, t_delay, start_q = traj_t_delay_start_q
 
         if start_q is not None:
             self.rob.q_vect = self._to_tensor(start_q)
-        
-        # split the trajectory into positions and orientations once and iterate through them 
+
+        self.start_q = self.rob.q_vect.clone()   # remember for playback
+
+        # split the trajectory into positions and orientations once and iterate through them
         Goal_posi_traj = trajectory[:, 0:3]
         Goal_Ori_6D_traj = trajectory[:, 3:]
         for i in range(len(trajectory)):
             Goal_posi = Goal_posi_traj[i]
             Goal_Ori_6D = Goal_Ori_6D_traj[i]
-        
+
             self.q_curr = self.rob.q_vect.clone()
             result = self.get_IK(Goal_Posi=Goal_posi, Goal_Ori_6D=Goal_Ori_6D)
-            q_vect_trajectory.append(result)
+            # Store absolute q alongside the result so the visualiser never
+            # needs to accumulate deltas from an unknown starting point.
+            q_abs = self.rob.q_vect.clone()   # get_IK already applied delta
+            q_vect_trajectory.append((result, q_abs))
 
-        print(f'joint trajectory = {[r.x for r in q_vect_trajectory]}')
+        print(f'joint trajectory = {[r.x for r, _ in q_vect_trajectory]}')
         print(f'crashed? = {self.L.crashed}')
 
-        # return q_vect_trajectory, t_delay, self.L.crashed
         self.current_trajectory = q_vect_trajectory
         self.current_time_delay = t_delay
 

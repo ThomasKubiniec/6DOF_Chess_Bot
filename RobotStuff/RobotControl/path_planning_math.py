@@ -126,17 +126,22 @@ class PathPlannerMath:
         use 6D Rotation representation to prevent gymbal lock.
         '''
 
+        saved_q = self.robot.q_vect.clone()
+
         if q_init is not None:
+            self.robot.q_vect = torch.as_tensor(q_init, dtype=self.dtype)
             my_start_pos = self.robot.give_ds()[-1]
             my_start_ori = to_6D_R(self.robot.give_Rs()[-1])
-
             start_pos_ori = torch.cat([my_start_pos, my_start_ori])
 
         if q_end is not None:
+            self.robot.q_vect = torch.as_tensor(q_end, dtype=self.dtype)
             my_end_pos = self.robot.give_ds()[-1]
             my_end_ori = to_6D_R(self.robot.give_Rs()[-1])
-
             end_pos_ori = torch.cat([my_end_pos, my_end_ori])
+
+        # Restore robot to its original pose — MoveL is read-only w.r.t. state
+        self.robot.q_vect = saved_q
 
         if (q_init is None) and (start_pos_ori is None):
             print(f'Please enter a valid starting robot pose or a valid starting coordinate set.\n pose was {q_init}\ncoordinates were {start_pos_ori}')

@@ -385,13 +385,11 @@ def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
 
     ghost_qs = []
     markers  = []
-    q_running = _to_tensor(traj_tuple[2]) if traj_tuple[2] is not None else robot.q_vect.clone()
 
-    for i, res in enumerate(traj_results):
-        delta_q = _to_tensor(res.x)
-        q_abs   = q_running + delta_q
-        ghost_qs.append(q_abs.clone())
-        q_running = q_abs   # carry forward for next step
+    # current_trajectory now stores (result, q_abs) tuples — q_abs is the
+    # absolute joint vector after that IK step, recorded during the solve.
+    for i, (res, q_abs) in enumerate(traj_results):
+        ghost_qs.append(q_abs)
 
         pos_6d  = workspace[i]
         pos     = pos_6d[:3].detach().numpy()
@@ -412,17 +410,16 @@ def _action_play_trajectory(state: SharedState, viz: RobotVisualizer):
         return
 
     viz.clear_scene()
-    ghost_qs  = []
-    q_running = robot.q_vect.clone()
-    delay     = max(solver.current_time_delay, 0.04)
+    ghost_qs = []
+    delay    = max(solver.current_time_delay, 0.04)
 
-    for res in traj:
-        delta_q  = _to_tensor(res.x)
-        q_abs    = q_running + delta_q
-        q_running = q_abs
-        ghost_qs.append(q_abs.clone())
+    # Start the orange robot at the recorded start pose before animating.
+    start_q = solver.start_q if hasattr(solver, 'start_q') else _to_tensor(traj[0][1])
+    viz.set_current_q(start_q)
 
-        viz.set_ghost_trail(list(ghost_qs))
+    for res, q_abs in traj:
+        # ghost_qs.append(q_abs)
+        # viz.set_ghost_trail(list(ghost_qs))
         viz.set_current_q(q_abs)
         time.sleep(delay)
 
