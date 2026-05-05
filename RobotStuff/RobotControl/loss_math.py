@@ -194,9 +194,19 @@ class Loss_Math:
 
         new_pose = q_curr + delta_q_next
 
+        # self.rob.q_vect = new_pose
+        # new_position    = self.rob.give_ds()[-1]
+        # new_orientation = self.rob.give_Rs()[-1]
+
+        old_q = self.rob.q_vect.clone()
+
         self.rob.q_vect = new_pose
-        new_position    = self.rob.give_ds()[-1]
+        new_position = self.rob.give_ds()[-1]
         new_orientation = self.rob.give_Rs()[-1]
+
+        self.rob.q_vect = old_q
+
+
 
         e_pos  = self.err_pos(pos_curr=new_position, pos_G_ws=pos_G_workspace)
         e_ori  = self.err_ori(new_ori_SO3=new_orientation, G_SO3=ori_G_SO3)
@@ -243,10 +253,11 @@ class Loss_Math:
         '''
         Solutions are within an ideal distance and angle from target
         '''
-        if e_pos + e_ori > self.max_good_err_pos + self.max_good_err_deg: 
+        if e_pos + e_ori > self.max_good_err_pos + self.max_good_err_deg:
             # did not meet criteria for being 'good', check if it meets criteria for being 'okay'
             self.get_okay_pass_or_fail(e_pos= e_pos, e_ori= e_ori)
-        self.target_weight = 1 # this is a good datapoint, loss should be multiplied by 1 for training    
+            return False  # good threshold missed — result set by get_okay_pass_or_fail
+        self.target_weight = 1  # good datapoint
         return True
     
 

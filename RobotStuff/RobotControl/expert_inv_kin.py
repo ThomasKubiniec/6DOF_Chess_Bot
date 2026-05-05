@@ -45,6 +45,8 @@ class Oracle:
         self.current_trajectory = []
         self.current_time_delay = 0
 
+        self.loss_curr = torch.tensor([0.0], requires_grad=True)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -68,13 +70,37 @@ class Oracle:
     # ------------------------------------------------------------------
     # scipy objective (must return a plain Python float)
     # ------------------------------------------------------------------
-    def _cost(self, x: np.ndarray,
-              Goal_Posi: torch.Tensor,
-              Goal_Ori_6D: torch.Tensor) -> float:
-        """
-        Wrapper around Loss_Math.Loss for scipy.optimize.minimize.
-        x  — delta_q as a NumPy array (shape (n,))
-        """
+    # def _cost(self, x: np.ndarray,
+    #           Goal_Posi: torch.Tensor,
+    #           Goal_Ori_6D: torch.Tensor) -> float:
+    #     """
+    #     Wrapper around Loss_Math.Loss for scipy.optimize.minimize.
+    #     x  — delta_q as a NumPy array (shape (n,))
+    #     """
+    #     Goal_Ori_SO3 = to_SO3(Goal_Ori_6D)
+
+    #     loss = self.L.Loss(
+    #         delta_q_prev=self.delta_q_prev,
+    #         q_curr=self.q_curr,
+    #         delta_q_next=x,
+    #         pos_G_workspace=Goal_Posi,
+    #         ori_G_SO3=Goal_Ori_SO3,
+    #     )
+
+    #     self.loss_curr = loss
+    #     return float(loss)
+
+
+    # ------------------------------------------------------------------
+    # scipy objective with gradient backpropegation inherent. 
+    # ------------------------------------------------------------------
+    def _cost_and_grad(self, x_np: np.ndarray,
+                   Goal_Posi: torch.Tensor,
+                   Goal_Ori_6D: torch.Tensor):
+
+    # ---- Convert to torch with gradients ----
+        x = torch.tensor(x_np, dtype=torch.float64, requires_grad=True)
+
         Goal_Ori_SO3 = to_SO3(Goal_Ori_6D)
 
         loss = self.L.Loss(
@@ -84,7 +110,19 @@ class Oracle:
             pos_G_workspace=Goal_Posi,
             ori_G_SO3=Goal_Ori_SO3,
         )
-        return float(loss)
+
+        # ---- Backprop ----
+        loss.backward()
+
+        grad = x.grad.detach().cpu().numpy().astype(np.float64)
+
+        return float(loss.detach()), grad
+
+    #--------------------------------
+    # Wrapped Scipy objective
+    #--------------------------------
+    def _fun_and_jac(self, x, Goal_Posi, Goal_Ori_6D):
+        return self._cost_and_grad(x, Goal_Posi, Goal_Ori_6D)
 
 
     # ------------------------------------------------------------------
@@ -107,7 +145,7 @@ class Oracle:
         Goal_Posi   = self._to_tensor(Goal_Posi)
         Goal_Ori_6D = self._to_tensor(Goal_Ori_6D)
 
-        my_fun = lambda x: self._cost(x, Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
+        # my_fun = lambda x: self._cost(x, Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
 
         # Moving bounds: shift the absolute joint limits by q_curr so that
         # q_curr + delta_q is guaranteed to stay within joint limits.
@@ -116,16 +154,19 @@ class Oracle:
         
         moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr).detach().cpu().numpy()
         bounds_obj = Bounds(moving_bounds[:, 0], moving_bounds[:, 1])
-        res = minimize(fun=my_fun,
-                       x0=np.zeros(len(self.q_curr)),
-                       method="L-BFGS-B",
-                       bounds=bounds_obj) # moving_bounds)
-
-        # moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr)
         # res = minimize(fun=my_fun,
         #                x0=np.zeros(len(self.q_curr)),
         #                method="L-BFGS-B",
-        #                bounds=moving_bounds)
+        #                bounds=bounds_obj,
+        #                jac= self.loss_curr.backward()) 
+
+        res = minimize(
+            fun=lambda x: self._fun_and_jac(x, Goal_Posi, Goal_Ori_6D),
+            x0=np.zeros(len(self.q_curr)),
+            method="L-BFGS-B",
+            bounds=bounds_obj,
+            jac=True
+        )
 
         self.get_delta_q(new_delta_q=res.x)
 
@@ -154,7 +195,7 @@ class Oracle:
                                       pitch_deg= self.current_YPR_targ[1],
                                       roll_deg= self.current_YPR_targ[2]))
 
-        my_fun = lambda x: self._cost(x, Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
+        # my_fun = lambda x: self._cost(x, Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
 
         # Moving bounds: shift the absolute joint limits by q_curr so that
         # q_curr + delta_q is guaranteed to stay within joint limits.
@@ -163,16 +204,19 @@ class Oracle:
         
         moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr).detach().cpu().numpy()
         bounds_obj = Bounds(moving_bounds[:, 0], moving_bounds[:, 1])
-        res = minimize(fun=my_fun,
-                       x0=np.zeros(len(self.q_curr)),
-                       method="L-BFGS-B",
-                       bounds=bounds_obj) # moving_bounds)
-
-        # moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr)
         # res = minimize(fun=my_fun,
         #                x0=np.zeros(len(self.q_curr)),
         #                method="L-BFGS-B",
-        #                bounds=moving_bounds)
+        #                bounds=bounds_obj,
+        #                jac= self.loss_curr.backward())
+
+        res = minimize(
+            fun=lambda x: self._fun_and_jac(x, Goal_Posi, Goal_Ori_6D),
+            x0=np.zeros(len(self.q_curr)),
+            method="L-BFGS-B",
+            bounds=bounds_obj,
+            jac=True
+        )
 
         self.get_delta_q(new_delta_q=res.x)
 
@@ -201,6 +245,8 @@ class Oracle:
 
         trajectory, t_delay, start_q = traj_t_delay_start_q
 
+        frames = len(trajectory)
+
         if start_q is not None:
             self.rob.q_vect = self._to_tensor(start_q)
 
@@ -210,6 +256,7 @@ class Oracle:
         Goal_posi_traj = trajectory[:, 0:3]
         Goal_Ori_6D_traj = trajectory[:, 3:]
         for i in range(len(trajectory)):
+            print(f'solving frame {i + 1}/{frames}')
             Goal_posi = Goal_posi_traj[i]
             Goal_Ori_6D = Goal_Ori_6D_traj[i]
 

@@ -142,9 +142,11 @@ class RobotVisualizer:
     def _draw_robot_on_ax(self, ax, q, line_color, joint_color, alpha):
         """Draw one robot pose onto ax."""
         ds, Rs = self._get_robot_geometry(q)
-        xs = [d[0] for d in ds]
-        ys = [d[1] for d in ds]
-        zs = [d[2] for d in ds]
+        # xs = [d[0] for d in ds]
+        # ys = [d[1] for d in ds]
+        # zs = [d[2] for d in ds]
+
+        xs, ys, zs = zip(*ds)
 
         ax.plot(xs, ys, zs, "-", color=line_color, alpha=alpha, linewidth=1.8)
         ax.scatter(xs, ys, zs, color=joint_color, s=14, alpha=alpha, zorder=4)

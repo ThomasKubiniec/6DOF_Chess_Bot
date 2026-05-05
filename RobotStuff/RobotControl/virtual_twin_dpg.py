@@ -234,9 +234,9 @@ def _make_config():
                  "min": -float(robot.max_reach), "max": float(robot.max_reach)},
                 {"name": "IK_target_Z",     "type": "float", "default": 0,
                  "min": -float(robot.max_reach), "max": float(robot.max_reach)},
-                {"name": "IK_target_ROLL",  "type": "float", "default": 0, "min": -90, "max": 90},
-                {"name": "IK_target_PITCH", "type": "float", "default": 0, "min": -90, "max": 90},
-                {"name": "IK_target_YAW",   "type": "float", "default": 0, "min": -90, "max": 90},
+                {"name": "IK_target_ROLL",  "type": "float", "default": 0, "min": -180, "max": 180},
+                {"name": "IK_target_PITCH", "type": "float", "default": 0, "min": -180, "max": 180},
+                {"name": "IK_target_YAW",   "type": "float", "default": 0, "min": -180, "max": 180},
                 {"name": "solve_IK",        "type": "button"},
             ],
         },
@@ -294,12 +294,11 @@ _LOSS_SETTERS = {
     "joint_acc_w6":    lambda v: solver.L.acc_lambda.__setitem__((5, 5), v),
 }
 
-_PASS_ATTRS = {
-    "max_good_dist":    "max_good_err_pos",
-    "max_good_ori_deg": "max_good_err_deg",
-    "max_okay_dist":    "max_ok_err_pos",
-    "max_okay_ori_deg": "max_ok_err_deg",
-}
+# Pass thresholds are applied via set_pass_thresholds() which normalises
+# distances and degrees into the same error space used by the loss function.
+# Writing raw slider floats directly to max_good_err_pos etc. would bypass
+# that normalisation and make every point appear green regardless of quality.
+_PASS_ATTRS = {}  # unused — handled explicitly in _apply_slider_state below
 
 
 _BUTTON_KEYS = {
@@ -316,9 +315,14 @@ def _apply_slider_state(snap: dict, viz: RobotVisualizer):
         if key in snap:
             setter(snap[key])
 
-    for key, attr in _PASS_ATTRS.items():
-        if key in snap:
-            setattr(solver.L, attr, snap[key])
+    # Normalise pass thresholds through set_pass_thresholds so distances and
+    # degrees are converted into the same scaled error space as e_pos / e_ori.
+    solver.L.set_pass_thresholds(
+        max_good_dist=snap.get("max_good_dist",    0.25),
+        max_good_deg =snap.get("max_good_ori_deg", 5.0),
+        max_ok_dist  =snap.get("max_okay_dist",    0.5),
+        max_ok_deg   =snap.get("max_okay_ori_deg", 15.0),
+    )
 
     solver.current_XYZ_targ[0] = snap.get("IK_target_X",     0.0)
     solver.current_XYZ_targ[1] = snap.get("IK_target_Y",     0.0)
@@ -348,12 +352,15 @@ def _apply_slider_state(snap: dict, viz: RobotVisualizer):
 
 def _ik_quality() -> str:
     w = solver.L.target_weight
+    # print(f'solve quality = {w}')
     if w >= 1.0:   return "good"
     if w >= 0.3:   return "okay"
     return "bad"
 
 
 def _action_solve_ik(state: SharedState, viz: RobotVisualizer):
+    state.set("show_ik_target", True)
+
     pre_q = robot.q_vect.clone()
     solver.get_IK_given_targ()
     post_q = robot.q_vect.clone()
@@ -372,16 +379,22 @@ def _action_solve_ik(state: SharedState, viz: RobotVisualizer):
 
 
 def _action_randomize_start(state: SharedState):
+    state.set("show_ik_target", False)
+
     path_planner.make_random_q_start()
     state.set("randomize_Start_path_planning", False)
 
 
 def _action_randomize_end(state: SharedState):
+    state.set("show_ik_target", False)
+
     path_planner.make_random_q_end()
     state.set("randomize_End_path_planning", False)
 
 
 def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
+    state.set("show_ik_target", False) # don't display IK target
+
     traj_tuple = path_planner.MoveL_mutable_start_stop()
     solver.follow_trajectory(traj_tuple)
 
@@ -410,6 +423,8 @@ def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
 
 
 def _action_play_trajectory(state: SharedState, viz: RobotVisualizer):
+    state.set("show_ik_target", False) # don't show IK target
+
     traj = solver.current_trajectory
     if not traj:
         return
@@ -467,6 +482,23 @@ def worker_loop(state: SharedState, viz: RobotVisualizer):
 
         # Apply slider state now that buttons are cleared
         _apply_slider_state(snap, viz)
+
+        show_ik = snap.get("show_ik_target", True)
+        if show_ik:
+            ypr = solver.current_YPR_targ
+            R_goal = YPR_SO3(
+                yaw_deg=float(ypr[0]),
+                pitch_deg=float(ypr[1]),
+                roll_deg=float(ypr[2])
+            ).numpy()
+
+            pos_goal = solver.current_XYZ_targ.detach().numpy()
+
+            viz.set_target_markers([{
+                "pos": pos_goal,
+                "R": R_goal,
+                "quality": _ik_quality()
+            }])
 
         # Run actions — these may be slow (scipy IK / path planning)
         if solve_ik:    _action_solve_ik(state, viz)
