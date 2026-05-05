@@ -157,9 +157,14 @@ class LiveUI:
                 callback=cb, user_data=name,
             )
         elif wtype == "button":
+            # IMPORTANT: user_data=name captures name by value at definition
+            # time.  The callback must read user_data, NOT name, because name
+            # is a loop variable that will have changed by the time any button
+            # is actually clicked.
             def btn_cb(sender, app_data, user_data=name):
+                print(f"[BTN] {user_data} pressed → setting state True")
                 self.state.set(user_data, True)
-            dpg.add_button(label=name, tag=tag, callback=btn_cb)
+            dpg.add_button(label=name, tag=tag, callback=btn_cb, user_data=name)
 
         # remember joint slider tags for write-back
         if name.startswith("j") and name[1:].isdigit() and wtype == "float":
@@ -295,6 +300,15 @@ _PASS_ATTRS = {
 }
 
 
+_BUTTON_KEYS = {
+    "solve_IK",
+    "randomize_Start_path_planning",
+    "randomize_End_path_planning",
+    "solve_path_planning",
+    "Play_Trajectory",
+}
+
+
 def _apply_slider_state(snap: dict, viz: RobotVisualizer):
     for key, setter in _LOSS_SETTERS.items():
         if key in snap:
@@ -311,13 +325,16 @@ def _apply_slider_state(snap: dict, viz: RobotVisualizer):
     solver.current_YPR_targ[1] = snap.get("IK_target_PITCH", 0.0)
     solver.current_YPR_targ[2] = snap.get("IK_target_ROLL",  0.0)
 
-    # FK joint sliders drive robot pose when no button action is running
-    q_new = torch.tensor([
-        snap.get("j1", 0.0), snap.get("j2", 0.0), snap.get("j3", 0.0),
-        snap.get("j4", 0.0), snap.get("j5", 0.0), snap.get("j6", 0.0),
-    ], dtype=torch.float64)
-    robot.q_vect = q_new
-    viz.set_current_q(q_new)
+    # Only drive robot.q_vect from the FK sliders when no button action is
+    # pending — otherwise we'd stomp the pose the solver is working with.
+    any_button_pending = any(snap.get(k) for k in _BUTTON_KEYS)
+    if not any_button_pending:
+        q_new = torch.tensor([
+            snap.get("j1", 0.0), snap.get("j2", 0.0), snap.get("j3", 0.0),
+            snap.get("j4", 0.0), snap.get("j5", 0.0), snap.get("j6", 0.0),
+        ], dtype=torch.float64)
+        robot.q_vect = q_new
+        viz.set_current_q(q_new)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,7 +364,6 @@ def _action_solve_ik(state: SharedState, viz: RobotVisualizer):
     viz.set_current_q(pre_q)
     viz.set_target_q(post_q)
     _queue_slider_write(post_q)
-    state.set("solve_IK", False)
 
 
 def _action_randomize_start(state: SharedState):
@@ -389,13 +405,10 @@ def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
         viz.set_current_q(ghost_qs[-1])
         _queue_slider_write(ghost_qs[-1])
 
-    state.set("solve_path_planning", False)
-
 
 def _action_play_trajectory(state: SharedState, viz: RobotVisualizer):
     traj = solver.current_trajectory
     if not traj:
-        state.set("Play_Trajectory", False)
         return
 
     viz.clear_scene()
@@ -413,8 +426,6 @@ def _action_play_trajectory(state: SharedState, viz: RobotVisualizer):
         viz.set_current_q(q_abs)
         time.sleep(delay)
 
-    state.set("Play_Trajectory", False)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Worker loop (background thread)
@@ -423,20 +434,44 @@ def _action_play_trajectory(state: SharedState, viz: RobotVisualizer):
 _WORKER_HZ = 20
 
 def worker_loop(state: SharedState, viz: RobotVisualizer):
+    tick = 0
     while True:
         snap = state.snapshot()
+        tick += 1
+
+        # Print button-relevant keys every 20 ticks so we can see state changing
+        if tick % 20 == 0:
+            btn_vals = {k: snap.get(k) for k in _BUTTON_KEYS}
+            print(f"[WORKER tick={tick}] button state: {btn_vals}")
+
+        # Detect button presses and immediately clear them in SharedState so
+        # _apply_slider_state on the next tick no longer sees them as pending
+        # (which would block FK slider updates for the duration of the action).
+        solve_ik   = snap.get("solve_IK")
+        rand_start = snap.get("randomize_Start_path_planning")
+        rand_end   = snap.get("randomize_End_path_planning")
+        solve_path = snap.get("solve_path_planning")
+        play_traj  = snap.get("Play_Trajectory")
+
+        if solve_ik:
+            print(f"[WORKER] solve_IK triggered!")
+            state.set("solve_IK", False)
+        if rand_start:  state.set("randomize_Start_path_planning", False)
+        if rand_end:    state.set("randomize_End_path_planning", False)
+        if solve_path:
+            print(f"[WORKER] solve_path_planning triggered!")
+            state.set("solve_path_planning", False)
+        if play_traj:   state.set("Play_Trajectory", False)
+
+        # Apply slider state now that buttons are cleared
         _apply_slider_state(snap, viz)
 
-        if snap.get("solve_IK"):
-            _action_solve_ik(state, viz)
-        if snap.get("randomize_Start_path_planning"):
-            _action_randomize_start(state)
-        if snap.get("randomize_End_path_planning"):
-            _action_randomize_end(state)
-        if snap.get("solve_path_planning"):
-            _action_solve_path_planning(state, viz)
-        if snap.get("Play_Trajectory"):
-            _action_play_trajectory(state, viz)
+        # Run actions — these may be slow (scipy IK / path planning)
+        if solve_ik:    _action_solve_ik(state, viz)
+        if rand_start:  _action_randomize_start(state)
+        if rand_end:    _action_randomize_end(state)
+        if solve_path:  _action_solve_path_planning(state, viz)
+        if play_traj:   _action_play_trajectory(state, viz)
 
         time.sleep(1.0 / _WORKER_HZ)
 
