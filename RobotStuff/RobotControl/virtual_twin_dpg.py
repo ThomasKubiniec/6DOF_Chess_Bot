@@ -243,6 +243,8 @@ def _make_config():
         {
             "group": "Path Planning",
             "items": [
+                {"name": "traj_frames",   "type": "int",   "default": 20,  "min": 2, "max": 200},
+                {"name": "traj_tot_time", "type": "float", "default": 1.0, "min": 0.1, "max": 30.0},
                 {"name": "randomize_Start_path_planning", "type": "button"},
                 {"name": "randomize_End_path_planning",   "type": "button"},
                 {"name": "solve_path_planning",           "type": "button"},
@@ -324,6 +326,9 @@ def _apply_slider_state(snap: dict, viz: RobotVisualizer):
     solver.current_YPR_targ[0] = snap.get("IK_target_YAW",   0.0)
     solver.current_YPR_targ[1] = snap.get("IK_target_PITCH", 0.0)
     solver.current_YPR_targ[2] = snap.get("IK_target_ROLL",  0.0)
+
+    path_planner.frames    = int(snap.get("traj_frames",   path_planner.frames))
+    path_planner.tot_time  = float(snap.get("traj_tot_time", path_planner.tot_time))
 
     # Only drive robot.q_vect from the FK sliders when no button action is
     # pending — otherwise we'd stomp the pose the solver is working with.
@@ -437,9 +442,9 @@ def worker_loop(state: SharedState, viz: RobotVisualizer):
         tick += 1
 
         # Print button-relevant keys every 20 ticks so we can see state changing
-        if tick % 20 == 0:
-            btn_vals = {k: snap.get(k) for k in _BUTTON_KEYS}
-            print(f"[WORKER tick={tick}] button state: {btn_vals}")
+        # if tick % 20 == 0:
+        #     btn_vals = {k: snap.get(k) for k in _BUTTON_KEYS}
+        #     print(f"[WORKER tick={tick}] button state: {btn_vals}")
 
         # Detect button presses and immediately clear them in SharedState so
         # _apply_slider_state on the next tick no longer sees them as pending
