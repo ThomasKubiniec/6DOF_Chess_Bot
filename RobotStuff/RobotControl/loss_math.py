@@ -59,8 +59,17 @@ class Loss_Math:
 
 
         # ---------- pass or fail thresholds ----------
-        self.max_err_pos = 0.1
-        self.max_err_deg = 0.2
+        # ideal offset
+        self.max_good_err_pos = 0.1
+        self.max_good_err_deg = 0.2
+
+        # acceptable
+        self.max_ok_err_pos = 0.1
+        self.max_ok_err_deg = 0.2
+
+        # the target weight associated with being good, okay, or bad
+        # good = 1, okay = 0.3, bad = 0 (bad targets are not in the dataset for the Neural Network)
+        self.target_weight = 0 
 
 
     # ------------------------------------------------------------------
@@ -214,18 +223,39 @@ class Loss_Math:
     # --------------------------------------------------------------------------
     # Automatically Detect if IK reached an acceptable closeness to the target
     # --------------------------------------------------------------------------
-    def set_pass_thresholds(self, max_acc_dist, max_acc_deg):
-        max_acc_dist = torch.tensor([max_acc_dist])
-        self.max_err_pos = self.pos_w * torch.linalg.norm((max_acc_dist) / self.rob.max_reach)
+    def set_pass_thresholds(self, max_good_dist, max_good_deg, max_ok_dist, max_ok_deg):
+        max_good_dist = torch.tensor([max_good_dist])
+        self.max_good_err_pos = self.pos_w * torch.linalg.norm((max_good_dist) / self.rob.max_reach)
 
-        max_acc_deg = Rx_SO3(theta_x_deg= max_acc_deg)
-        self.max_err_deg = self.rot_w * torch.linalg.matrix_norm(torch.eye(3) - max_acc_deg)
+        max_good_deg = Rx_SO3(theta_x_deg= max_good_deg)
+        self.max_good_err_deg = self.rot_w * torch.linalg.matrix_norm(torch.eye(3) - max_good_deg)
+
+
+        max_ok_dist = torch.tensor([max_ok_dist])
+        self.max_ok_err_pos = self.pos_w * torch.linalg.norm((max_ok_dist) / self.rob.max_reach)
+
+        max_ok_deg = Rx_SO3(theta_x_deg= max_ok_deg)
+        self.max_ok_err_deg = self.rot_w * torch.linalg.matrix_norm(torch.eye(3) - max_ok_deg)
         
         
 
     def get_pass_or_fail(self, e_pos, e_ori):
-        print(f'e_pos = {e_pos} max_err_pos = {self.max_err_pos} \n e_ori = {e_ori} max_err_deg = {self.max_err_deg}')
+        '''
+        Solutions are within an ideal distance and angle from target
+        '''
+        if e_pos + e_ori > self.max_good_err_pos + self.max_good_err_deg: 
+            # did not meet criteria for being 'good', check if it meets criteria for being 'okay'
+            self.get_okay_pass_or_fail(e_pos= e_pos, e_ori= e_ori)
+        self.target_weight = 1 # this is a good datapoint, loss should be multiplied by 1 for training    
+        return True
+    
 
-        if e_pos + e_ori > self.max_err_pos + self.max_err_deg:
-            return False
+    def get_okay_pass_or_fail(self, e_pos, e_ori):
+        '''
+        Solutions are within an acceptable distance and angle from target
+        '''
+        if e_pos + e_ori > self.max_ok_err_pos + self.max_ok_err_deg:
+            self.target_weight = 0
+            return False # this is a bad datapoint, it should not be included in the dataset
+        self.target_weight = 0.3 # this is an okay datapoint, loss should be multiplied by 0.3 for training
         return True

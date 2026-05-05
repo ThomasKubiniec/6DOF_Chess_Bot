@@ -39,6 +39,11 @@ class Oracle:
         self.delta_q_next = torch.zeros(n, dtype=torch.float64)
         self.q_curr       = self.rob.q_vect.clone()
 
+        self.current_XYZ_targ = torch.zeros(3, dtype=torch.float64)
+        self.current_YPR_targ = torch.zeros(3, dtype=torch.float64)
+
+        self.current_trajectory = []
+        self.current_time_delay = 0
 
     # ------------------------------------------------------------------
     # Helpers
@@ -131,6 +136,56 @@ class Oracle:
 
 
     # ------------------------------------------------------------------
+    # Single-step IK with internally given target
+    # ------------------------------------------------------------------
+    def get_IK_given_targ(self, start_q=None) -> np.ndarray:
+        """
+        Find delta_q that moves the robot toward Goal_Posi / Goal_Ori_6D
+        while minimising velocity, acceleration, and self-collision penalty.
+
+        Returns the raw scipy OptimizeResult (access .x for the delta_q array).
+        """
+        if start_q is not None:
+            self.rob.q_vect = self._to_tensor(start_q)
+        self.q_curr = self.rob.q_vect.clone()
+
+        Goal_Posi   = self.current_XYZ_targ
+        Goal_Ori_6D = to_6D_R(YPR_SO3(yaw_deg= self.current_YPR_targ[0],
+                                      pitch_deg= self.current_YPR_targ[1],
+                                      roll_deg= self.current_YPR_targ[2]))
+
+        my_fun = lambda x: self._cost(x, Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
+
+        # Moving bounds: shift the absolute joint limits by q_curr so that
+        # q_curr + delta_q is guaranteed to stay within joint limits.
+        # The raw joint_bounds would wrongly constrain delta_q itself as if
+        # it were an absolute angle rather than a change in angle.
+        
+        moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr).detach().cpu().numpy()
+        bounds_obj = Bounds(moving_bounds[:, 0], moving_bounds[:, 1])
+        res = minimize(fun=my_fun,
+                       x0=np.zeros(len(self.q_curr)),
+                       method="L-BFGS-B",
+                       bounds=bounds_obj) # moving_bounds)
+
+        # moving_bounds = self.rob.delta_q_bounds(q_curr=self.q_curr)
+        # res = minimize(fun=my_fun,
+        #                x0=np.zeros(len(self.q_curr)),
+        #                method="L-BFGS-B",
+        #                bounds=moving_bounds)
+
+        self.get_delta_q(new_delta_q=res.x)
+
+        # apply the found delta to the robot for the next step
+        self.rob.q_vect = self.q_curr + self._to_tensor(res.x)
+
+        return res
+
+
+
+
+
+    # ------------------------------------------------------------------
     # Trajectory following
     # ------------------------------------------------------------------
     def follow_trajectory(self, traj_t_delay_start_q: tuple) -> tuple:
@@ -161,47 +216,48 @@ class Oracle:
         print(f'joint trajectory = {[r.x for r in q_vect_trajectory]}')
         print(f'crashed? = {self.L.crashed}')
 
-        return q_vect_trajectory, t_delay, self.L.crashed
+        # return q_vect_trajectory, t_delay, self.L.crashed
+        self.current_trajectory = q_vect_trajectory
+        self.current_time_delay = t_delay
+
+# # ----------------------------------------------------------------------
+# # Smoke test
+# # ----------------------------------------------------------------------
+# def test_point_to_point():
+#     # ---- Define a 3-DOF robot (2 revolute + 1 prismatic) ----
+#     a     = [500.0, 500.0, 0.0]
+#     alpha = [0.0,   0.0,   0.0]
+#     d     = [400.0, 0.0,   0.0]
+#     theta = [0.0,   0.0,   0.0]
+#     joint_types  = ['r', 'r', 'p']
+#     joint_bounds = [
+#         (np.deg2rad(-90), np.deg2rad(90)),
+#         (np.deg2rad(-90), np.deg2rad(90)),
+#         (-200.0, 0.0),
+#     ]
+#     link_radii = [10.0, 10.0, 10.0]
+
+#     R = Robot_math(a=a, alpha=alpha, d=d, theta=theta,
+#                    joint_type=joint_types,
+#                    bounds=joint_bounds,
+#                    fail_dist=link_radii)
+
+#     R.q_vect = torch.zeros(3, dtype=torch.float64)
+
+#     oracle = Oracle(robot_class=R)
+#     oracle.reset_vars()
+
+#     Goal_Posi   = torch.tensor([707.0, 0.0, 0.0], dtype=torch.float64)
+#     Goal_Ori_6D = to_6D_R(Rz_SO3(theta_z_deg=45.0))
+
+#     result = oracle.get_IK(Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
+
+#     print(f'\nOptimisation success : {result.success}')
+#     print(f'delta_q found        : {result.x}')
+#     print(f'end-effector pos     :\n{R.give_ds()[-1]}')
+#     print(f'end-effector ori     :\n{R.give_Rs()[-1]}')
+#     print(f'crashed?             : {oracle.L.crashed}')
 
 
-# ----------------------------------------------------------------------
-# Smoke test
-# ----------------------------------------------------------------------
-def test_point_to_point():
-    # ---- Define a 3-DOF robot (2 revolute + 1 prismatic) ----
-    a     = [500.0, 500.0, 0.0]
-    alpha = [0.0,   0.0,   0.0]
-    d     = [400.0, 0.0,   0.0]
-    theta = [0.0,   0.0,   0.0]
-    joint_types  = ['r', 'r', 'p']
-    joint_bounds = [
-        (np.deg2rad(-90), np.deg2rad(90)),
-        (np.deg2rad(-90), np.deg2rad(90)),
-        (-200.0, 0.0),
-    ]
-    link_radii = [10.0, 10.0, 10.0]
-
-    R = Robot_math(a=a, alpha=alpha, d=d, theta=theta,
-                   joint_type=joint_types,
-                   bounds=joint_bounds,
-                   fail_dist=link_radii)
-
-    R.q_vect = torch.zeros(3, dtype=torch.float64)
-
-    oracle = Oracle(robot_class=R)
-    oracle.reset_vars()
-
-    Goal_Posi   = torch.tensor([707.0, 0.0, 0.0], dtype=torch.float64)
-    Goal_Ori_6D = to_6D_R(Rz_SO3(theta_z_deg=45.0))
-
-    result = oracle.get_IK(Goal_Posi=Goal_Posi, Goal_Ori_6D=Goal_Ori_6D)
-
-    print(f'\nOptimisation success : {result.success}')
-    print(f'delta_q found        : {result.x}')
-    print(f'end-effector pos     :\n{R.give_ds()[-1]}')
-    print(f'end-effector ori     :\n{R.give_Rs()[-1]}')
-    print(f'crashed?             : {oracle.L.crashed}')
-
-
-if __name__ == "__main__":
-    test_point_to_point()
+# if __name__ == "__main__":
+#     test_point_to_point()

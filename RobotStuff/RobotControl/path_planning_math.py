@@ -29,6 +29,12 @@ class PathPlannerMath:
         self.dtype = dtype
         self.device = device or torch.device("cpu")
 
+        self.q_start = self.robot.q_vect
+        self.q_end = self.robot.q_vect
+
+        self.tot_time = 1
+        self.frames = 20
+
     def cubic_interp_vect(self,
                           vect_0,
                           vect_1,
@@ -154,7 +160,22 @@ class PathPlannerMath:
 
         random_q = low + (high - low) * torch.rand(low.size())
         return random_q
+    
 
+    def make_random_q_start(self):
+        self.q_start = self.make_random_poses()
+
+    def make_random_q_end(self):
+        self.q_end = self.make_random_poses()
+
+    def MoveL_mutable_start_stop(self):
+        workspace_traj, time_delay, initial_pose = self.MoveL(tot_time= self.tot_time,
+                                                              frames= self.frames,
+                                                              q_init= self.q_start,
+                                                              q_end= self.q_end,
+                                                              start_pos_ori= None,
+                                                              end_pos_ori= None)
+        return workspace_traj, time_delay, initial_pose
 
     def random_MoveL(self, tot_time, frames):
         rand_q_init = self.make_random_poses()

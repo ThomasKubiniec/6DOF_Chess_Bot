@@ -144,8 +144,13 @@ class VirtualTwinLive:
         self.acc_lambdas = [acc_w] * self.n
 
         # pass/fail distance and angle thresholds (physical units / degrees)
-        self.thresh_dist_val = 0.5   # physical units
-        self.thresh_deg_val  = 5.0   # degrees
+        # self.thresh_dist_val = 0.5   # physical units
+        # self.thresh_deg_val  = 5.0   # degrees
+        self.good_dist_val = 0.25 # inches
+        self.good_deg_val = 5.0 # degrees
+        self.okay_dist_val = 0.5
+        self.okay_deg_val = 15
+
 
         # ── Oracle & planner ──────────────────────────────────────────────────
         self.oracle  = self._make_oracle()
@@ -332,8 +337,10 @@ class VirtualTwinLive:
         bb = self._ax_thresh.get_position()
         w, h, gap = 0.065, 0.026, 0.008
         labels   = [f"dist ({self.unit_label})", "orient (deg)"]
-        initvals = [self.thresh_dist_val, self.thresh_deg_val]
-        keys     = ["thresh_dist", "thresh_deg"]
+        # initvals = [self.thresh_dist_val, self.thresh_deg_val]
+        initvals = [self.good_dist_val, self.good_deg_val, self.okay_dist_val, self.okay_deg_val]
+        # keys     = ["thresh_dist", "thresh_deg"]
+        keys = ["good_dist", "good_deg", "okay_dist", "okay_deg"]
         total = 2 * (w + gap) - gap
         x0 = bb.x0 + (bb.width - total) / 2
         y  = bb.y0 + 0.005
@@ -670,12 +677,21 @@ class VirtualTwinLive:
             self.rot_w   = float(self._textboxes["rot_w"].text)
             self.crash_w = float(self._textboxes["crash_w"].text)
             self.dist_w  = float(self._textboxes["dist_w"].text)
-            self.thresh_dist_val = float(self._textboxes["thresh_dist"].text)
-            self.thresh_deg_val  = float(self._textboxes["thresh_deg"].text)
+            # self.thresh_dist_val = float(self._textboxes["thresh_dist"].text)
+            # self.thresh_deg_val  = float(self._textboxes["thresh_deg"].text)
+
+            self.good_dist_val = float(self._textboxes["g_dist"].text)
+            self.good_deg_val  = float(self._textboxes["g_deg"].text)
+
+            self.okay_dist_val = float(self._textboxes["o_dist"].text)
+            self.okay_deg_val  = float(self._textboxes["o_deg"].text)
+
         except ValueError as e:
             self._status(f"Bad value: {e}", "#ff4444"); return
         self.oracle = self._make_oracle()
-        self.oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+        # oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+        self.oracle.L.set_pass_thresholds(self.good_dist_val, self.good_deg_val,
+                                          self.okay_dist_val, self.okay_deg_val)
         self._status("Weights applied", "#00ff88")
 
     def _on_commit_pose(self, _):
@@ -779,7 +795,9 @@ class VirtualTwinLive:
         try:
             goal_6d = _rpy_to_6d(self.goal_rpy)
             oracle  = self._make_oracle()
-            oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            # oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            self.oracle.L.set_pass_thresholds(self.good_dist_val, self.good_deg_val,
+                                              self.okay_dist_val, self.okay_deg_val)
             oracle.reset_vars()
             oracle.delta_q_prev = self.delta_q_prev.clone()
             oracle.q_curr       = self.q_curr.clone()
@@ -828,7 +846,9 @@ class VirtualTwinLive:
         try:
             frames   = int(self._sl_frames.val)
             oracle   = self._make_oracle()
-            oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            # oracle.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            self.oracle.L.set_pass_thresholds(self.good_dist_val, self.good_deg_val,
+                                              self.okay_dist_val, self.okay_deg_val)
             oracle.rob.q_vect = self.q_curr.clone()
 
             # ── Build the workspace trajectory ────────────────────────────────
@@ -877,7 +897,9 @@ class VirtualTwinLive:
             # We can't rely on oracle.L.Pass (it reflects only the last frame),
             # so re-evaluate each result against its workspace goal.
             oracle_check = self._make_oracle()
-            oracle_check.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            # oracle_check.L.set_pass_thresholds(self.thresh_dist_val, self.thresh_deg_val)
+            self.oracle.L.set_pass_thresholds(self.good_dist_val, self.good_deg_val,
+                                              self.okay_dist_val, self.okay_deg_val)
 
             for fi, res in enumerate(q_results):
                 delta_q = _t(res.x)
