@@ -45,8 +45,10 @@ class Loss_Math:
         if acc_lambda is None:
             acc_lambda = [0.1] * n
 
-        self.vel_lambda = torch.diag(torch.tensor(vel_lambda, dtype=torch.float64))
-        self.acc_lambda = torch.diag(torch.tensor(acc_lambda, dtype=torch.float64))
+        # self.vel_lambda = torch.diag(torch.tensor(vel_lambda, dtype=torch.float64))
+        # self.acc_lambda = torch.diag(torch.tensor(acc_lambda, dtype=torch.float64))
+
+        self.lambda_lists_to_diag_matrix(vel_lambda= vel_lambda, acc_lambda= acc_lambda)
 
         # ---- joint bound tensors ----
         bounds_tensor   = torch.tensor(self.rob.joint_bounds, dtype=torch.float64)  # (n, 2)
@@ -85,6 +87,11 @@ class Loss_Math:
         self.Pass = True
 
 
+    def lambda_lists_to_diag_matrix(self, vel_lambda, acc_lambda):
+        self.vel_lambda = torch.diag(torch.tensor(vel_lambda, dtype=torch.float64))
+        self.acc_lambda = torch.diag(torch.tensor(acc_lambda, dtype=torch.float64))
+
+
 
     # ------------------------------------------------------------------
     # Normalisation utilities
@@ -95,6 +102,11 @@ class Loss_Math:
         pos_curr = self._to_tensor(pos_curr)
         pos_G_ws = self._to_tensor(pos_G_ws)
         return (pos_G_ws - pos_curr) / self.rob.max_reach
+
+
+    def get_normal_joint_value(self, q_vect: torch.Tensor) -> torch.Tensor:
+        q_vect_normal = q_vect / (self.rob.high_bounds - self.rob.low_bounds)
+        return q_vect_normal
 
     def get_normal_joint_vel(self, delta_q: torch.Tensor) -> torch.Tensor:
         """Map delta_q into [-1, 1] using the joint range."""
@@ -266,7 +278,8 @@ class Loss_Math:
         Solutions are within an acceptable distance and angle from target
         '''
         if e_pos + e_ori > self.max_ok_err_pos + self.max_ok_err_deg:
-            self.target_weight = 0
-            return False # this is a bad datapoint, it should not be included in the dataset
+            self.target_weight = 0.05 # bad datapoints are sometimes necessary, they should be learned with a large discount 
+            # print(f'target_weight = {self.target_weight}')
+            return False # fail
         self.target_weight = 0.3 # this is an okay datapoint, loss should be multiplied by 0.3 for training
         return True

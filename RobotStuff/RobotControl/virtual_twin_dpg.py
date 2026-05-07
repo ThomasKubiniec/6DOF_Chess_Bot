@@ -352,7 +352,7 @@ def _apply_slider_state(snap: dict, viz: RobotVisualizer):
 
 def _ik_quality() -> str:
     w = solver.L.target_weight
-    # print(f'solve quality = {w}')
+    print(f'solve quality = {w}')
     if w >= 1.0:   return "good"
     if w >= 0.3:   return "okay"
     return "bad"
@@ -378,6 +378,7 @@ def _action_solve_ik(state: SharedState, viz: RobotVisualizer):
     _queue_slider_write(post_q)
 
 
+
 def _action_randomize_start(state: SharedState):
     state.set("show_ik_target", False)
 
@@ -391,9 +392,16 @@ def _action_randomize_end(state: SharedState):
     path_planner.make_random_q_end()
     state.set("randomize_End_path_planning", False)
 
+def _path_planning_quality(my_frame_target_w) -> str:
+    # print(f'solve quality = {w}')
+    if my_frame_target_w >= 1.0:   return "good"
+    if my_frame_target_w >= 0.3:   return "okay"
+    return "bad"
+
 
 def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
     state.set("show_ik_target", False) # don't display IK target
+    viz.clear_scene() # wipe old trajectory to save performance
 
     traj_tuple = path_planner.MoveL_mutable_start_stop()
     solver.follow_trajectory(traj_tuple)
@@ -407,12 +415,15 @@ def _action_solve_path_planning(state: SharedState, viz: RobotVisualizer):
     # current_trajectory now stores (result, q_abs) tuples — q_abs is the
     # absolute joint vector after that IK step, recorded during the solve.
     for i, (res, q_abs) in enumerate(traj_results):
+        w = solver.current_traj_grade[i]
+
         ghost_qs.append(q_abs)
 
         pos_6d  = workspace[i]
         pos     = pos_6d[:3].detach().numpy()
         R_mat   = to_SO3(pos_6d[3:]).detach().numpy()
-        markers.append({"pos": pos, "R": R_mat, "quality": _ik_quality()})
+        markers.append({"pos": pos, "R": R_mat, "quality": _path_planning_quality(my_frame_target_w= w)})
+        print(f'Target {i+1} quality = {_path_planning_quality(my_frame_target_w= w)}')
 
     viz.clear_scene()
     viz.set_ghost_trail(ghost_qs)
@@ -521,7 +532,7 @@ def dpg_thread_fn(state: SharedState, ui_ready: threading.Event):
     ui = LiveUI(state, config)
     ui.build()
 
-    dpg.create_viewport(title="IK Tuning UI", width=440, height=720)
+    dpg.create_viewport(title="IK Tuning UI", width=440, height=800)
     dpg.setup_dearpygui()
     dpg.show_viewport()
 
