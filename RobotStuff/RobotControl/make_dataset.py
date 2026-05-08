@@ -165,7 +165,7 @@ class data_generator:
 
         current_ori_SO3 = self.robot.give_Rs()[-1]
         targ_ori_SO3 = to_SO3(target_ori)
-        rot_to_targ_SO3 = targ_ori_SO3 - current_ori_SO3
+        rot_to_targ_SO3 = targ_ori_SO3.T @ current_ori_SO3 # rotation from curr to goal in SO3
         rot_to_targ_6D_R = to_6D_R(rot_to_targ_SO3)
         
         return (delta_q_N, q_vect_N, dist_to_targ_N, rot_to_targ_6D_R)
