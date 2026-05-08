@@ -59,15 +59,23 @@ def batch_to_tensors(batch, device: torch.device):
 
     for (inp, out, tw) in batch:
         delta_q_N, q_N, dist_N, rot_6D = inp
-        delta_q_N_list.append(delta_q_N)
-        q_N_list.append(q_N)
-        dist_N_list.append(dist_N)
-        rot_6D_list.append(rot_6D)
-        delta_q_out_list.append(out)
-        tw_list.append(torch.tensor(tw, dtype=torch.float64))
+        # delta_q_N_list.append(delta_q_N)
+        # q_N_list.append(q_N)
+        # dist_N_list.append(dist_N)
+        # rot_6D_list.append(rot_6D)
+        # delta_q_out_list.append(out)
+        # tw_list.append(torch.tensor(tw, dtype=torch.float64))
+        delta_q_N_list.append(delta_q_N.to(torch.float32))
+        q_N_list.append(q_N.to(torch.float32))
+        dist_N_list.append(dist_N.to(torch.float32))
+        rot_6D_list.append(rot_6D.to(torch.float32))
+        delta_q_out_list.append(out.to(torch.float32))
+        tw_list.append(torch.tensor(tw, dtype=torch.float32)) # 32 bit for GPU efficiency
+        
 
     def _stack(lst):
-        return torch.stack(lst).to(dtype=torch.float64, device=device)
+        # return torch.stack(lst).to(dtype=torch.float64, device=device)
+        return torch.stack(lst).to(dtype=torch.float32, device=device) # 32 bit for GPU efficiency
 
     X = torch.cat([_stack(delta_q_N_list),
                    _stack(q_N_list),
@@ -160,7 +168,7 @@ if __name__ == "__main__":
     # dataset.make_dataset()
 
     # ── Option B: load a pre-generated dataset ───────────────────────
-    # dataset.load_dataset('training_data_5_6_26')
+    # dataset.load_dataset('robot_training_data_5_8_26')
 
     model = IK(
         robot=robot,
@@ -174,5 +182,5 @@ if __name__ == "__main__":
         epochs=200,
         batch_size=512,
         lr=1e-3,
-        save_path="ik_model.pt",
+        save_path="ik_model_hw256_hd4.pt",
     )
