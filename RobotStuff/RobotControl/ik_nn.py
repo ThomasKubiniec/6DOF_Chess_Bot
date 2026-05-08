@@ -62,7 +62,8 @@ class IK(nn.Module):
         self.net = nn.Sequential(*layer_list)
 
         # Move the whole network to the target device
-        self.to(device=self.device, dtype=torch.float64)
+        # self.to(device=self.device, dtype=torch.float64)
+        self.to(device=self.device, dtype=torch.float32) # for GPU efficiency
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -111,11 +112,12 @@ class IK(nn.Module):
         """
         Normalise raw inputs → forward pass → rescale output back to joint-space.
 
-        Returns delta_q in joint space (radians / metres).
+        Returns delta_q in joint space (radians / inches).
         """
         # Move inputs to device
         def _t(v):
-            return v.to(dtype=torch.float64, device=self.device)
+            # return v.to(dtype=torch.float64, device=self.device)
+            return v.to(dtype=torch.float32, device=self.device) # for GPU efficiency
 
         delta_q_prev = _t(delta_q_prev)
         q_curr       = _t(q_curr)

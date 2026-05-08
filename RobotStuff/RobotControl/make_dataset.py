@@ -172,7 +172,8 @@ class data_generator:
                  solver: Oracle,
                  path_planner: PathPlannerMath,
                  low_frac, high_frac,
-                 std_low, std_high, p_low):
+                 std_low, std_high, p_low,
+                 frame_low_n=20, frame_high_n=100):
 
         self.robot        = robot
         self.solver       = solver
@@ -184,6 +185,9 @@ class data_generator:
         self.mean_high = self.robot.max_reach * high_frac
         self.std_high  = std_high
         self.p_low     = p_low
+
+        self.frame_low_n = frame_low_n
+        self.frame_high_n = frame_high_n
 
     def _kw(self):
         return dict(dtype=torch.float64, device=self.device)
@@ -255,10 +259,10 @@ class data_generator:
         q1 = self.make_random_q_vect()
         q2 = self.make_random_q_vect()
 
-        frame_low    = 20
-        frame_high   = 100
-        frames_range = torch.linspace(frame_low, frame_high,
-                                      steps=frame_high - frame_low + 1)
+        # frame_low    = 20
+        # frame_high   = 100
+        frames_range = torch.linspace(self.frame_low_n, self.frame_high_n,
+                                      steps= (self.frame_high_n - self.frame_low_n + 1))
         frames = int(frames_range[
             torch.randint(0, len(frames_range), (1,)).item()].item())
 
@@ -275,6 +279,7 @@ class data_generator:
         inputs  = []
         outputs = []
 
+        # append the first trajectory frame (0 initial joint velocity)
         inputs.append(self.normalize_inputs(
             delta_q_prev=torch.zeros(len(self.robot.a), **self._kw()),
             q_vect=initial_pose,
@@ -283,6 +288,7 @@ class data_generator:
         ))
         outputs.append(self.solver.current_trajectory[0][0])
 
+        # append the rest of the trajectory frames
         for i, ws_traj in enumerate(workspace_traj[1:]):
             inputs.append(self.normalize_inputs(
                 delta_q_prev=self.solver.current_trajectory[i - 1][0],
@@ -317,6 +323,8 @@ class my_dataframe:
         Args:
             num_workers: parallel worker count.
                          Defaults to (cpu_count - 1), minimum 1.
+
+        Measures total time, and estimates remaining time throughout
         """
         if num_workers is None:
             num_workers = max(1, (os.cpu_count() or 2) - 1)
@@ -452,6 +460,10 @@ if __name__ == "__main__":
                         help="Resume from an existing .pkl file (no extension)")
     parser.add_argument("--filename", type=str, default="training_data",
                         help="Output .pkl filename without extension")
+    parser.add_argument("--frame_low_n",   type=int, default=20,
+                        help="lowest traj frame number (default: 20)")
+    parser.add_argument("--frame_high_n",   type=int, default=100,
+                        help="highest traj frame number (default: 100)")
     args = parser.parse_args()
 
     # Main process runs its stack on CPU too — GPU stays free for training.
@@ -468,6 +480,7 @@ if __name__ == "__main__":
     path_planner = PathPlannerMath(my_robot=robot)
     data_gen     = data_generator(robot=robot, solver=solver,
                                   path_planner=path_planner,
+                                  frame_low_n= args.frame_low_n, frame_high_n= args.frame_high_n
                                   **make_generator_config())
 
     dataset = my_dataframe(
@@ -482,3 +495,10 @@ if __name__ == "__main__":
 
     dataset.make_dataset(num_workers=args.workers)
     dataset.save_dataset()
+
+
+# To change dataset name:
+# python make_dataset.py --filename my_robot_dataset
+
+# Change other arguments:
+# python make_dataset.py --filename my_robot_dataset --frames 500000 --workers 10
