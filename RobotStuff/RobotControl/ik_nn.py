@@ -52,7 +52,7 @@ class IK(nn):
             - previous joint velocity normalized
             - current joint pose normalized
             - distance from goal to end-effector normalized
-            - 6D goal orientation (already normalized) 
+            - difference in orientation found in SO3 and converted to 6DR 
 
         output: A tensor consisting of 
             - the normalized joint velocity to get to the goal position and orientation
