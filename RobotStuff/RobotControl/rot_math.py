@@ -1,49 +1,63 @@
 """
 Rotation math utilities - pure PyTorch implementation.
 Covers SO3 rotation matrices, 6D rotation representation, and Euler angle constructors.
+
+GPU-aware: every function accepts an optional `device` argument (defaults to
+cuda if available, cpu otherwise).  Pass `device` explicitly when mixing
+devices to avoid cross-device errors.
 """
 import torch
 import math
 
+# ---------------------------------------------------------------------------
+# Module-level default device — set once, used everywhere
+# ---------------------------------------------------------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def Rx_SO3(theta_x_deg: float) -> torch.Tensor:
+
+def Rx_SO3(theta_x_deg: float, device=None) -> torch.Tensor:
     """Rotation matrix about the X axis."""
+    device = device or DEVICE
     t = math.radians(theta_x_deg)
     c, s = math.cos(t), math.sin(t)
     return torch.tensor([
         [1,  0,  0],
         [0,  c, -s],
         [0,  s,  c],
-    ], dtype=torch.float64)
+    ], dtype=torch.float64, device=device)
 
 
-def Ry_SO3(theta_y_deg: float) -> torch.Tensor:
+def Ry_SO3(theta_y_deg: float, device=None) -> torch.Tensor:
     """Rotation matrix about the Y axis."""
+    device = device or DEVICE
     t = math.radians(theta_y_deg)
     c, s = math.cos(t), math.sin(t)
     return torch.tensor([
         [ c,  0,  s],
         [ 0,  1,  0],
         [-s,  0,  c],
-    ], dtype=torch.float64)
+    ], dtype=torch.float64, device=device)
 
 
-def Rz_SO3(theta_z_deg: float) -> torch.Tensor:
+def Rz_SO3(theta_z_deg: float, device=None) -> torch.Tensor:
     """Rotation matrix about the Z axis."""
+    device = device or DEVICE
     t = math.radians(theta_z_deg)
     c, s = math.cos(t), math.sin(t)
     return torch.tensor([
         [c, -s,  0],
         [s,  c,  0],
         [0,  0,  1],
-    ], dtype=torch.float64)
+    ], dtype=torch.float64, device=device)
 
 
-def YPR_SO3(yaw_deg: float, pitch_deg: float, roll_deg: float) -> torch.Tensor:
+def YPR_SO3(yaw_deg: float, pitch_deg: float, roll_deg: float,
+            device=None) -> torch.Tensor:
     """
     Yaw-Pitch-Roll (ZYX) rotation: R = Rz(yaw) @ Ry(pitch) @ Rx(roll)
     """
-    return Rz_SO3(yaw_deg) @ Ry_SO3(pitch_deg) @ Rx_SO3(roll_deg)
+    device = device or DEVICE
+    return Rz_SO3(yaw_deg, device) @ Ry_SO3(pitch_deg, device) @ Rx_SO3(roll_deg, device)
 
 
 def to_6D_R(R: torch.Tensor) -> torch.Tensor:
@@ -52,13 +66,14 @@ def to_6D_R(R: torch.Tensor) -> torch.Tensor:
     (first two columns of R, flattened): shape (6,)
     """
     R = R.to(torch.float64)
-    return torch.cat([R[:, 0], R[:, 1]])  # (6,)
+    return torch.cat([R[:, 0], R[:, 1]])  # (6,)  — stays on same device as R
 
 
 def to_SO3(r6d: torch.Tensor) -> torch.Tensor:
     """
     Recover a 3x3 SO3 rotation matrix from a 6D representation.
     Uses Gram-Schmidt orthonormalisation on the two stored columns.
+    Output lives on the same device as the input.
     """
     r6d = r6d.to(torch.float64)
     a1 = r6d[:3]
