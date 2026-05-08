@@ -45,7 +45,7 @@ import time
 from collections import deque
 
 import multiprocessing as mp
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Event
 
 from forward_kinematics import Robot_math
 from path_planning_math import PathPlannerMath
@@ -123,7 +123,8 @@ def _build_cpu_stack() -> "data_generator":
 # ===========================================================================
 # Worker process entry point
 # ===========================================================================
-def _worker_fn(worker_id: int, result_queue: Queue, stop_event: mp.Event):
+# def _worker_fn(worker_id: int, result_queue: Queue, stop_event: Event):
+def _worker_fn(worker_id: int, result_queue: Queue, stop_event): # removed "Event" to stop pylance error
     """
     Infinite generation loop.  Each completed trajectory is serialised to
     plain Python lists (tensors don't pickle reliably across spawn boundaries)
@@ -436,6 +437,8 @@ class my_dataframe:
 # Entry point
 # ===========================================================================
 if __name__ == "__main__":
+
+    print(f'cpu count = {os.cpu_count()}')
     # Required on Windows / macOS (spawn start method).
     # Safe no-op on Linux (fork), but always good practice.
     mp.set_start_method("spawn", force=True)
