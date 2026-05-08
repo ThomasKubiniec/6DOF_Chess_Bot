@@ -259,7 +259,7 @@ class my_dataframe:
             if len(self.my_dataset) >= self.datapoints_goal:
                 done = True
             
-            print(f'collected {trajectory_collected} datapoints')
+            print(f'collected {trajectory_collected} unique trajectories')
 
     
 
@@ -319,6 +319,12 @@ if __name__ == "__main__":
                     dist_w= 0.5,
                     vel_lambda= [0.1] * 6,
                     acc_lambda= [0.1] * 6)
+    
+    solver.L.max_good_err_pos = 0.1
+    solver.L.max_good_err_pos = 2
+
+    solver.L.max_ok_err_pos = 0.25
+    solver.L.max_ok_err_pos = 6
 
 
     path_planner = PathPlannerMath(my_robot=robot)
