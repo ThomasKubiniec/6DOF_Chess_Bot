@@ -162,6 +162,127 @@ class Robot_math:
         return Rs
 
     # ------------------------------------------------------------------
+    # Batched Forward Kinematics
+    # ------------------------------------------------------------------
+    def build_DH_A_batch(self,
+                         a_i:     torch.Tensor,   # scalar
+                         alpha_i: torch.Tensor,   # scalar
+                         d_i:     torch.Tensor,   # (B,) for prismatic, scalar for revolute
+                         theta_i: torch.Tensor,   # (B,)
+                         ) -> torch.Tensor:       # (B, 4, 4)
+        """
+        Batched DH link transform.  All trig ops vectorise over the batch
+        dimension B; the result is a (B, 4, 4) stack of homogeneous matrices.
+
+        alpha_i and a_i are always per-link scalars (DH parameters).
+        theta_i is (B,) for revolute joints (q added per sample).
+        d_i     is (B,) for prismatic joints (q added per sample),
+                or a scalar broadcast for revolute joints.
+        """
+        B  = theta_i.shape[0]
+
+        sa = torch.sin(alpha_i)                   # scalar
+        ca = torch.cos(alpha_i)                   # scalar
+        st = torch.sin(theta_i)                   # (B,)
+        ct = torch.cos(theta_i)                   # (B,)
+
+        z  = torch.zeros(B, dtype=torch.float64, device=self.device)   # (B,)
+        o  = torch.ones (B, dtype=torch.float64, device=self.device)   # (B,)
+
+        # Broadcast scalar d_i to (B,) if needed
+        if not isinstance(d_i, torch.Tensor) or d_i.ndim == 0:
+            d_i = d_i * o                         # (B,)
+
+        # Build the 4×4 matrix column-by-column then reshape.
+        # Each element is (B,) — we stack into (B, 4, 4).
+        #
+        #  [ ct    -st*ca   st*sa   a*ct ]
+        #  [ st     ct*ca  -ct*sa   a*st ]
+        #  [  0      sa      ca      d   ]
+        #  [  0       0       0      1   ]
+        rows = [
+            torch.stack([ ct,      -st * ca,   st * sa,  a_i * ct], dim=1),  # (B, 4)
+            torch.stack([ st,       ct * ca,  -ct * sa,  a_i * st], dim=1),  # (B, 4)
+            torch.stack([ z,        sa * o,    ca * o,   d_i     ], dim=1),  # (B, 4)
+            torch.stack([ z,        z,         z,        o       ], dim=1),  # (B, 4)
+        ]
+        return torch.stack(rows, dim=1)           # (B, 4, 4)
+
+    def FK_batch(self, q_batch: torch.Tensor) -> list:
+        """
+        Batched FK over a (B, n) joint tensor.
+
+        Returns a list of n tensors each shaped (B, 4, 4) — one per joint,
+        in world frame.  Mirrors the structure of FK() so the rest of the
+        class stays easy to reason about.
+        """
+        q = q_batch.to(dtype=torch.float64, device=self.device)  # (B, n)
+        B = q.shape[0]
+
+        # Expand the world transform to the full batch: (1, 4, 4) → (B, 4, 4)
+        H = self.WT.unsqueeze(0).expand(B, -1, -1).clone()       # (B, 4, 4)
+
+        joint_FKs = []
+
+        for i in range(len(self.a)):
+            if self.joint_type[i] == 'r':
+                theta_i = self.theta[i] + q[:, i]   # (B,)
+                d_i     = self.d[i]                  # scalar
+            elif self.joint_type[i] == 'p':
+                theta_i = self.theta[i].expand(B)    # (B,) — constant per sample
+                d_i     = self.d[i] + q[:, i]        # (B,)
+            else:
+                raise ValueError(f"Unknown joint type: {self.joint_type[i]!r}")
+
+            A = self.build_DH_A_batch(
+                a_i=self.a[i], alpha_i=self.alpha[i],
+                d_i=d_i, theta_i=theta_i,
+            )                                        # (B, 4, 4)
+
+            H = torch.bmm(H, A)                      # (B, 4, 4)
+            joint_FKs.append(H)
+
+        return joint_FKs                             # list of n × (B, 4, 4)
+
+    def give_ds_batch(self, q_batch: torch.Tensor) -> torch.Tensor:
+        """
+        End-effector positions for a batch of joint configs.
+
+        q_batch : (B, n)
+        returns : (B, 3)  — XYZ of the last frame in world coordinates
+        """
+        joint_FKs = self.FK_batch(q_batch)
+        return joint_FKs[-1][:, :3, 3]              # (B, 3)
+
+    def give_Rs_batch(self, q_batch: torch.Tensor) -> torch.Tensor:
+        """
+        End-effector rotation matrices for a batch of joint configs.
+
+        q_batch : (B, n)
+        returns : (B, 3, 3)
+        """
+        joint_FKs = self.FK_batch(q_batch)
+        return joint_FKs[-1][:, :3, :3]             # (B, 3, 3)
+
+    def give_all_ds_batch(self, q_batch: torch.Tensor) -> torch.Tensor:
+        """
+        All frame positions for a batch of joint configs — useful if you
+        ever want to extend collision checking to the batched pipeline.
+
+        q_batch : (B, n)
+        returns : (B, n+1, 3)  — world-frame positions of every joint frame
+                                  (index 0 = world origin / WT translation)
+        """
+        B         = q_batch.shape[0]
+        joint_FKs = self.FK_batch(q_batch)
+
+        # Prepend the world-transform origin, broadcast to (B, 3)
+        wt_origin = self.WT[:3, 3].unsqueeze(0).expand(B, -1)   # (B, 3)
+        frames    = [wt_origin] + [H[:, :3, 3] for H in joint_FKs]
+
+        return torch.stack(frames, dim=1)            # (B, n+1, 3)
+
+    # ------------------------------------------------------------------
     # Geometric Jacobian
     # ------------------------------------------------------------------
     def J(self) -> list:
