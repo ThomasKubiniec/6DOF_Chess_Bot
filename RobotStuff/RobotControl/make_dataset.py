@@ -11,7 +11,7 @@ Architecture
                   │    Queue    │  mp.Queue — completed traj frame batches
                   └──────▲──────┘
         ┌─────────────┬──┴──┬─────────────┐
-        │  worker 0   │ ... │  worker N-1  │  CPU-only Oracle solvers
+        │  worker 0   │ ... │  worker N-1 │  CPU-only Oracle solvers
         └─────────────┘     └─────────────┘
 
 Each worker owns its own Robot_math + Oracle + PathPlannerMath instance
@@ -224,7 +224,7 @@ class data_generator:
     def make_random_q_vect(self) -> torch.Tensor:
         """Sample random joint angles that reach a non-crashing pose."""
         while True:
-            goal_xyz     = self.make_rand_xyz()
+            goal_xyz = self.make_rand_xyz()
             goal_ori_SO3 = self.make_random_YPR()
             q_vect = self.solver.get_IK_traditional(
                 Goal_Posi=goal_xyz, Goal_ori_SO3=goal_ori_SO3)
@@ -250,6 +250,7 @@ class data_generator:
         rot_to_targ_6D_R = to_6D_R(rot_to_targ_SO3)
 
         return (delta_q_N, q_vect_N, dist_to_targ_N, rot_to_targ_6D_R)
+
 
     def make_random_traj(self):
         """
@@ -286,7 +287,7 @@ class data_generator:
             target_xyz=workspace_traj[0][:3],
             target_ori=workspace_traj[0][3:],
         ))
-        outputs.append(self.solver.current_trajectory[0][0])
+        outputs.append(self.solver.L.get_normal_joint_vel(self.solver.current_trajectory[0][0]))
 
         # append the rest of the trajectory frames
         for i, ws_traj in enumerate(workspace_traj[1:]):
@@ -296,7 +297,7 @@ class data_generator:
                 target_xyz=ws_traj[:3],
                 target_ori=ws_traj[3:],
             ))
-            outputs.append(self.solver.current_trajectory[i][0])
+            outputs.append(self.solver.L.get_normal_joint_vel(self.solver.current_trajectory[i][0]))
 
         return inputs, outputs, self.solver.current_traj_grade.copy()
 
@@ -480,7 +481,7 @@ if __name__ == "__main__":
     path_planner = PathPlannerMath(my_robot=robot)
     data_gen     = data_generator(robot=robot, solver=solver,
                                   path_planner=path_planner,
-                                  frame_low_n= args.frame_low_n, frame_high_n= args.frame_high_n
+                                  frame_low_n= args.frame_low_n, frame_high_n= args.frame_high_n,
                                   **make_generator_config())
 
     dataset = my_dataframe(

@@ -92,25 +92,70 @@ class Loss_Math:
         pos_curr = self._to_tensor(pos_curr)
         pos_G_ws = self._to_tensor(pos_G_ws)
         return (pos_G_ws - pos_curr) / self.rob.max_reach
+    
+    def normalize_to_range(self, x, low, high):
+        """
+        Normalizes tensor x to the range [-1, 1] based on 
+        provided low and high bound tensors.
+        """
+        # Formula: 2 * (x - low) / (high - low) - 1
+        return 2.0 * (x - low) / (high - low) - 1.0
+
+
+    def normalize_to_range(self, x, low, high):
+        """
+        Normalizes tensor x to the range [-1, 1] based on 
+        provided low and high bound tensors.
+        """
+        denom = torch.clamp(high - low, min=1e-8)
+        # Formula: 2 * (x - low) / (high - low) - 1
+        return 2.0 * ((x - low) / (denom)) - 1.0
 
     def get_normal_joint_value(self, q_vect: torch.Tensor) -> torch.Tensor:
-        q_vect = self._to_tensor(q_vect)
-        return q_vect / (self.rob.high_bounds - self.rob.low_bounds)
+        """Map q_vect into [-1, 1]"""
+        return self.normalize_to_range(x= q_vect, low= self.rob.low_bounds, high= self.rob.high_bounds)
 
     def get_normal_joint_vel(self, delta_q: torch.Tensor) -> torch.Tensor:
-        """Map delta_q into [-1, 1] using the joint range."""
-        delta_q = self._to_tensor(delta_q)
-        return 2.0 * ((delta_q - self.q_l) / (self.q_h - self.q_l)) - 1.0
+        """Map delta_q into [-1, 1]"""
+        # largest negative velocity = moving from high to low in one step
+        # largest positive velocity = moving from low to high in one step
+        return self.normalize_to_range(x= delta_q, 
+                                low= (self.rob.low_bounds - self.rob.high_bounds),
+                                high= (self.rob.high_bounds - self.rob.low_bounds))
 
-    def get_normal_joint_acc(self, delta_q_prev: torch.Tensor,
-                              delta_q_new: torch.Tensor) -> torch.Tensor:
-        """Normalised change in normalised velocity."""
-        Nv_prev = self.get_normal_joint_vel(delta_q_prev)
-        Nv_new  = self.get_normal_joint_vel(delta_q_new)
-        return (Nv_new - Nv_prev) / 2.0
+
+    def get_normal_joint_acc(self,
+                             delta_q_prev: torch.Tensor,
+                             delta_q_new: torch.Tensor) -> torch.Tensor:
+            """Normalised change in normalised velocity, mapping joint acc to [-1, 1]"""
+            Nv_prev = self.get_normal_joint_vel(delta_q_prev)
+            Nv_new  = self.get_normal_joint_vel(delta_q_new)
+            return (Nv_new - Nv_prev) / 2.0
 
     def get_normal_link_dist(self, link_dist: torch.Tensor) -> torch.Tensor:
         return self._to_tensor(link_dist) / self.rob.max_reach
+    
+    # -----------------------------------------------------------------
+    # Rescale outputs
+    # ----------------------------------------------------------------
+    def denormalize_from_range(self, x_norm, low, high):
+        """
+        Rescales a tensor from the range [-1, 1] back to its 
+        original [low, high] bounds.
+        """
+        # Formula: ((x_norm + 1) * (high - low) / 2) + low
+        return ((x_norm + 1.0) * (high - low) / 2.0) + low
+
+    # Example for your Robot_math setup:
+    def get_original_joint_value(self, q_norm: torch.Tensor) -> torch.Tensor:
+        """Map q_norm from [-1, 1] back to original radians"""
+        return self.denormalize_from_range(
+            x_norm= q_norm, 
+            low= self.rob.low_bounds, 
+            high= self.rob.high_bounds
+        )
+
+
 
     # ------------------------------------------------------------------
     # Individual error terms
@@ -173,11 +218,11 @@ class Loss_Math:
         Full loss used by both the Oracle and the Neural Network.
 
         Args:
-            delta_q_prev    : previous joint velocity  (n,)
+            delta_q_prev    : previous joint velocity   (n,)
             q_curr          : current joint angles      (n,)
             delta_q_next    : predicted joint velocity  (n,)  — variable being optimised
             pos_G_workspace : goal EE position in world frame  (3,)
-            ori_G_SO3       : goal rotation matrix              (3, 3)
+            ori_G_SO3       : goal rotation matrix             (3, 3)
         """
         delta_q_prev    = self._to_tensor(delta_q_prev)
         q_curr          = self._to_tensor(q_curr)

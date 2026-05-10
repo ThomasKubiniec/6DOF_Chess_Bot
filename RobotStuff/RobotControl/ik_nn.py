@@ -42,6 +42,9 @@ class IK(nn.Module):
         self.n          = len(self.robot.a)
         self.input_dim  = (2 * self.n) + 3 + 6  # 2×joints + xyz + 6D orientation
         self.output_dim = self.n
+        self.hid_dim = hid_dim
+        self.hid_layers = hid_layers
+
 
         # ── Build layers ──────────────────────────────────────────────
         layer_list = []
@@ -134,6 +137,8 @@ class IK(nn.Module):
         # → dq = (nv + 1) / 2 * (q_h - q_l) + q_l
         q_l = self.L.q_l
         q_h = self.L.q_h
-        delta_q = (delta_q_N + 1.0) / 2.0 * (q_h - q_l) + q_l
-
+        # delta_q = (delta_q_N + 1.0) / 2.0 * (q_h - q_l) + q_l
+        half_range = (q_h - q_l) / 2.0
+        delta_q = delta_q_N * half_range
+        
         return delta_q
