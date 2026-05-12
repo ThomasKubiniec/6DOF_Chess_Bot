@@ -535,17 +535,475 @@ class RealDatasetAnalyzer:
         self.plot(out_dir=out_dir, prefix=prefix)
 
 
+
+
+# ===========================================================================
+# 3.  SimpleIKDatasetAnalyzer
+# ===========================================================================
+class SimpleIKDatasetAnalyzer:
+    """
+    Analyses the simple IK dataset produced by make_simple_ik_dataset.py.
+
+    Each frame is a (xyz (3,), SO3 (3,3)) tuple of raw end-effector
+    coordinates stored from a random joint configuration.
+
+    Plots produced:
+      1. XY / XZ / YZ density heatmaps  — EE position coverage
+      2. Per-axis position histograms    — distribution shape per axis
+      3. Orientation spread              — histogram of ||R - I||_F per frame
+                                           (proxy for how varied orientations are)
+    """
+
+    def __init__(self, robot: Robot_math):
+        self.robot   = robot
+        self.dataset = None          # list of (xyz, SO3) tuples after load()
+        self.xyz_arr : np.ndarray | None = None   # (N, 3)
+        self.ori_frob: np.ndarray | None = None   # (N,)  Frobenius norm vs identity
+
+    # ------------------------------------------------------------------
+    def load(self, filename: str):
+        path = f"{filename}.pkl"
+        with open(path, "rb") as f:
+            raw = pickle.load(f)
+        # deque or list — normalise to list
+        self.dataset = list(raw)
+        print(f"[SimpleIK] Loaded {len(self.dataset):,} frames ← {path}")
+
+    # ------------------------------------------------------------------
+    def analyse(self, report_every: int = 50_000):
+        if self.dataset is None:
+            raise RuntimeError("Call load() first.")
+
+        n = len(self.dataset)
+        print(f"[SimpleIK] Analysing {n:,} frames ...")
+        t0 = time.time()
+
+        xyz_rows  = np.empty((n, 3), dtype=np.float32)
+        ori_frob  = np.empty(n,      dtype=np.float32)
+        I3        = np.eye(3, dtype=np.float32)
+
+        for i, (xyz, SO3) in enumerate(self.dataset):
+            xyz_np = xyz.detach().cpu().numpy().astype(np.float32)                 if isinstance(xyz, torch.Tensor) else np.asarray(xyz, np.float32)
+            SO3_np = SO3.detach().cpu().numpy().astype(np.float32)                 if isinstance(SO3, torch.Tensor) else np.asarray(SO3, np.float32)
+
+            xyz_rows[i] = xyz_np
+            ori_frob[i] = np.linalg.norm(SO3_np - I3, "fro")
+
+            if (i + 1) % report_every == 0:
+                elapsed = time.time() - t0
+                eta     = (n - i - 1) / max((i + 1) / elapsed, 1e-9)
+                print(f"  {i+1:>8,} / {n:,}  |  {elapsed:.0f}s  |  ETA {eta:.0f}s",
+                      end="\r", flush=True)
+
+        print()
+        self.xyz_arr  = xyz_rows
+        self.ori_frob = ori_frob
+        print(f"[SimpleIK] Done in {time.time() - t0:.1f}s")
+
+    # ------------------------------------------------------------------
+    def plot(self, out_dir: str = ".", prefix: str = "simple_ik"):
+        if self.xyz_arr is None:
+            raise RuntimeError("Call analyse() first.")
+
+        _apply_style()
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        xs, ys, zs = self.xyz_arr[:, 0], self.xyz_arr[:, 1], self.xyz_arr[:, 2]
+
+        # ── Figure 1: workspace heatmaps ─────────────────────────────
+        fig = plt.figure(figsize=(14, 4.5))
+        gs  = gridspec.GridSpec(1, 4, width_ratios=[1, 1, 1, 0.05],
+                                wspace=0.35, left=0.07, right=0.93)
+        ax_xy = fig.add_subplot(gs[0])
+        ax_xz = fig.add_subplot(gs[1])
+        ax_yz = fig.add_subplot(gs[2])
+        cax   = fig.add_subplot(gs[3])
+
+        im = _density_heatmap(ax_xy, xs, ys, "X", "Y", "XY Plane")
+        _density_heatmap(ax_xz, xs, zs, "X", "Z", "XZ Plane")
+        _density_heatmap(ax_yz, ys, zs, "Y", "Z", "YZ Plane")
+        fig.colorbar(im, cax=cax, label="Frame count (log scale)")
+        fig.suptitle(f"Simple IK Dataset — EE Workspace Coverage\n"
+                     f"({len(self.xyz_arr):,} frames)",
+                     fontsize=11, fontweight="bold", y=1.02)
+        p1 = out / f"{prefix}_workspace_heatmaps.png"
+        fig.savefig(p1, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved → {p1}")
+
+        # ── Figure 2: per-axis histograms ─────────────────────────────
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        for ax, data, label, color in zip(
+                axes, [xs, ys, zs], ["X", "Y", "Z"],
+                ["#1f77b4", "#ff7f0e", "#2ca02c"]):
+            ax.hist(data, bins=80, color=color, edgecolor="none", alpha=0.85)
+            ax.set_xlabel(f"{label} position")
+            ax.set_ylabel("Count")
+            ax.set_title(f"{label}-axis Distribution  "
+                         f"[{data.min():.1f}, {data.max():.1f}]")
+            ax.grid(True, axis="y")
+            # Annotate mean ± std
+            ax.axvline(data.mean(), color="black", linewidth=1.2,
+                       linestyle="--", label=f"mean={data.mean():.2f}")
+            ax.axvline(data.mean() - data.std(), color="grey",
+                       linewidth=0.8, linestyle=":")
+            ax.axvline(data.mean() + data.std(), color="grey",
+                       linewidth=0.8, linestyle=":", label=f"±σ={data.std():.2f}")
+            ax.legend(fontsize=7)
+        fig.suptitle("Simple IK Dataset — Per-Axis EE Position Distribution",
+                     fontsize=11, fontweight="bold")
+        fig.tight_layout()
+        p2 = out / f"{prefix}_axis_histograms.png"
+        fig.savefig(p2, dpi=150)
+        plt.close(fig)
+        print(f"  Saved → {p2}")
+
+        # ── Figure 3: orientation spread ─────────────────────────────
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.hist(self.ori_frob, bins=80, color="#9467bd",
+                edgecolor="none", alpha=0.85)
+        ax.set_xlabel("||R − I||_F  (Frobenius norm vs identity)")
+        ax.set_ylabel("Count")
+        ax.set_title("Simple IK Dataset — Orientation Spread\n"
+                     "(0 = identity, larger = more rotated)")
+        ax.axvline(self.ori_frob.mean(), color="black", linewidth=1.2,
+                   linestyle="--", label=f"mean={self.ori_frob.mean():.3f}")
+        ax.legend()
+        ax.grid(True, axis="y")
+        fig.tight_layout()
+        p3 = out / f"{prefix}_orientation_spread.png"
+        fig.savefig(p3, dpi=150)
+        plt.close(fig)
+        print(f"  Saved → {p3}")
+
+    # ------------------------------------------------------------------
+    def print_summary(self):
+        if self.xyz_arr is None:
+            raise RuntimeError("Call analyse() first.")
+        print("\n── Simple IK Dataset Summary ────────────────────────────")
+        print(f"  Total frames : {len(self.xyz_arr):>10,}")
+        mr = float(self.robot.max_reach)
+        for i, axis in enumerate("XYZ"):
+            col = self.xyz_arr[:, i]
+            print(f"  EE {axis}         : [{col.min():8.3f}, {col.max():8.3f}]"
+                  f"  mean={col.mean():.3f}  σ={col.std():.3f}")
+        radii = np.linalg.norm(self.xyz_arr, axis=1)
+        print(f"  Radius       : [{radii.min():.3f}, {radii.max():.3f}]"
+              f"  mean={radii.mean():.3f}  (max_reach={mr:.3f})")
+        print(f"  Ori spread   : mean ||R-I||_F = {self.ori_frob.mean():.4f}"
+              f"  σ={self.ori_frob.std():.4f}")
+        pct_inner = 100.0 * (radii < mr * 0.5).mean()
+        pct_outer = 100.0 * (radii > mr * 0.75).mean()
+        print(f"  Inner 50%r   : {pct_inner:.1f}% of frames")
+        print(f"  Outer 75%r   : {pct_outer:.1f}% of frames")
+        print("─────────────────────────────────────────────────────────\n")
+
+    # ------------------------------------------------------------------
+    def run(self, filename: str, out_dir: str = ".", prefix: str = "simple_ik"):
+        self.load(filename)
+        self.analyse()
+        self.print_summary()
+        self.plot(out_dir=out_dir, prefix=prefix)
+
+
+# ===========================================================================
+# 4.  ChessboardDatasetAnalyzer
+# ===========================================================================
+class ChessboardDatasetAnalyzer:
+    """
+    Analyses the chessboard test dataset produced by test_data_maker.py.
+
+    Structure: list of move_dicts, each with:
+        move_dict['legs'][leg_idx][solver_name] = [frame_dict, ...]
+        frame_dict = {q, xyz, SO3, quality, e_pos, e_ori}
+
+    Plots produced per solver:
+      1. Quality bar chart          — good / okay / bad counts per leg + total
+      2. e_pos + e_ori violin plots — error distribution per leg
+      3. EE trajectory scatter      — XY and XZ views, colour-coded by quality
+    Plus a cross-solver comparison chart.
+    """
+
+    SOLVERS  = ("oracle", "simple_ik", "imit_ik")
+    SOLVER_COLORS = {
+        "oracle"    : "#1f77b4",
+        "simple_ik" : "#ff7f0e",
+        "imit_ik"   : "#2ca02c",
+    }
+    QUALITY_COLORS = {"good": "#2ca02c", "okay": "#ff7f0e", "bad": "#d62728"}
+    LEG_NAMES = ["Leg 0\nHome→A", "Leg 1\nA→B", "Leg 2\nB→C", "Leg 3\nC→D"]
+
+    def __init__(self, robot: Robot_math):
+        self.robot   = robot
+        self.dataset = None    # list of move_dicts after load()
+
+        # populated by analyse()
+        # stats[solver][leg_idx] = {'good': n, 'okay': n, 'bad': n,
+        #                            'e_pos': [...], 'e_ori': [...],
+        #                            'xyz': ndarray (N,3)}
+        self.stats: dict | None = None
+
+    # ------------------------------------------------------------------
+    def load(self, filename: str):
+        path = f"{filename}.pkl"
+        with open(path, "rb") as f:
+            self.dataset = pickle.load(f)
+        print(f"[Chess] Loaded {len(self.dataset):,} moves ← {path}")
+
+    # ------------------------------------------------------------------
+    def analyse(self):
+        if self.dataset is None:
+            raise RuntimeError("Call load() first.")
+
+        n_moves = len(self.dataset)
+        n_legs  = 4
+
+        # Initialise accumulators
+        stats = {}
+        for s in self.SOLVERS:
+            stats[s] = []
+            for _ in range(n_legs):
+                stats[s].append({
+                    "good": 0, "okay": 0, "bad": 0,
+                    "e_pos": [], "e_ori": [], "xyz": [],
+                })
+
+        for move in self.dataset:
+            for leg_idx in range(n_legs):
+                leg = move["legs"][leg_idx]
+                for solver in self.SOLVERS:
+                    frames = leg.get(solver, [])
+                    acc    = stats[solver][leg_idx]
+                    for f in frames:
+                        acc[f["quality"]] += 1
+                        acc["e_pos"].append(f["e_pos"])
+                        acc["e_ori"].append(f["e_ori"])
+                        xyz = f["xyz"]
+                        xyz_np = xyz.detach().cpu().numpy()                             if isinstance(xyz, torch.Tensor) else np.asarray(xyz)
+                        acc["xyz"].append(xyz_np.astype(np.float32))
+
+        # Convert lists to arrays
+        for s in self.SOLVERS:
+            for leg_idx in range(n_legs):
+                acc = stats[s][leg_idx]
+                acc["e_pos"] = np.array(acc["e_pos"], dtype=np.float32)
+                acc["e_ori"] = np.array(acc["e_ori"], dtype=np.float32)
+                acc["xyz"]   = np.array(acc["xyz"],   dtype=np.float32)                     if acc["xyz"] else np.empty((0, 3), dtype=np.float32)
+
+        self.stats = stats
+        total = sum(
+            stats["oracle"][l]["good"] + stats["oracle"][l]["okay"] + stats["oracle"][l]["bad"]
+            for l in range(n_legs))
+        print(f"[Chess] Analysis complete — {n_moves} moves, {total:,} total oracle frames")
+
+    # ------------------------------------------------------------------
+    def _quality_counts(self, solver, leg_idx):
+        acc = self.stats[solver][leg_idx]
+        return acc["good"], acc["okay"], acc["bad"]
+
+    # ------------------------------------------------------------------
+    def plot(self, out_dir: str = ".", prefix: str = "chess"):
+        if self.stats is None:
+            raise RuntimeError("Call analyse() first.")
+
+        _apply_style()
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+
+        # ── Figure 1: quality bar chart per solver ────────────────────
+        fig, axes = plt.subplots(1, len(self.SOLVERS),
+                                 figsize=(5 * len(self.SOLVERS), 5),
+                                 sharey=False)
+        for ax, solver in zip(axes, self.SOLVERS):
+            goods = [self.stats[solver][l]["good"] for l in range(4)]
+            okays = [self.stats[solver][l]["okay"] for l in range(4)]
+            bads  = [self.stats[solver][l]["bad"]  for l in range(4)]
+            x     = np.arange(4)
+            w     = 0.25
+            ax.bar(x - w, goods, w, label="Good", color=self.QUALITY_COLORS["good"])
+            ax.bar(x,     okays, w, label="Okay", color=self.QUALITY_COLORS["okay"])
+            ax.bar(x + w, bads,  w, label="Bad",  color=self.QUALITY_COLORS["bad"])
+            ax.set_xticks(x)
+            ax.set_xticklabels(self.LEG_NAMES, fontsize=8)
+            ax.set_title(solver.replace("_", " ").title())
+            ax.set_ylabel("Frame count")
+            ax.legend(fontsize=7)
+            ax.grid(True, axis="y")
+            # Annotate % good on top of each good bar
+            total_per_leg = [g + o + b for g, o, b in zip(goods, okays, bads)]
+            for xi, (g, t) in enumerate(zip(goods, total_per_leg)):
+                if t > 0:
+                    ax.text(xi - w, g + t * 0.01,
+                            f"{100*g/t:.0f}%", ha="center",
+                            va="bottom", fontsize=7, fontweight="bold")
+        fig.suptitle("Chessboard Dataset — Frame Quality by Solver and Leg",
+                     fontsize=12, fontweight="bold")
+        fig.tight_layout()
+        p1 = out / f"{prefix}_quality_bars.png"
+        fig.savefig(p1, dpi=150)
+        plt.close(fig)
+        print(f"  Saved → {p1}")
+
+        # ── Figure 2: e_pos violin per leg, all solvers overlaid ──────
+        for err_key, err_label in [("e_pos", "Position error (e_pos)"),
+                                   ("e_ori", "Orientation error (e_ori)")]:
+            fig, axes = plt.subplots(1, 4, figsize=(14, 5), sharey=True)
+            for leg_idx, ax in enumerate(axes):
+                data    = []
+                labels  = []
+                colours = []
+                for solver in self.SOLVERS:
+                    arr = self.stats[solver][leg_idx][err_key]
+                    if len(arr) > 0:
+                        data.append(arr)
+                        labels.append(solver.replace("_", "\n"))
+                        colours.append(self.SOLVER_COLORS[solver])
+                if data:
+                    parts = ax.violinplot(data, showmedians=True, showextrema=False)
+                    for pc, col in zip(parts["bodies"], colours):
+                        pc.set_facecolor(col)
+                        pc.set_alpha(0.7)
+                    parts["cmedians"].set_color("black")
+                    parts["cmedians"].set_linewidth(1.5)
+                ax.set_xticks(range(1, len(labels) + 1))
+                ax.set_xticklabels(labels, fontsize=8)
+                ax.set_title(self.LEG_NAMES[leg_idx])
+                ax.set_ylabel(err_label if leg_idx == 0 else "")
+                ax.grid(True, axis="y")
+            fig.suptitle(f"Chessboard Dataset — {err_label} Distribution by Leg",
+                         fontsize=11, fontweight="bold")
+            fig.tight_layout()
+            p = out / f"{prefix}_{err_key}_violins.png"
+            fig.savefig(p, dpi=150)
+            plt.close(fig)
+            print(f"  Saved → {p}")
+
+        # ── Figure 3: EE trajectory scatter XY + XZ, per solver ──────
+        fig, axes = plt.subplots(len(self.SOLVERS), 2,
+                                 figsize=(12, 4 * len(self.SOLVERS)))
+        for row, solver in enumerate(self.SOLVERS):
+            for col, (dim_a, dim_b, xlabel, ylabel) in enumerate([
+                    (0, 1, "X", "Y"), (0, 2, "X", "Z")]):
+                ax = axes[row, col]
+                for leg_idx in range(4):
+                    xyz = self.stats[solver][leg_idx]["xyz"]
+                    acc = self.stats[solver][leg_idx]
+                    n   = len(acc["e_pos"])
+                    if n == 0:
+                        continue
+                    # Colour each point by quality
+                    good_n = acc["good"]
+                    okay_n = acc["okay"]
+                    bad_n  = acc["bad"]
+                    # Reconstruct per-frame quality colour array:
+                    # frames were appended in order — use cumulative counts
+                    # (we don't store per-frame quality separately,
+                    #  so approximate: plot in three slabs)
+                    # Better: re-derive from e_pos threshold
+                    # We use e_pos + e_ori vs thresholds stored on robot's Loss_Math
+                    # but we don't have those here, so colour by sorted error quartiles.
+                    err_total = acc["e_pos"] + acc["e_ori"]
+                    q25, q75  = np.percentile(err_total, [25, 75])
+                    colors    = np.where(err_total < q25, self.QUALITY_COLORS["good"],
+                               np.where(err_total < q75, self.QUALITY_COLORS["okay"],
+                                                         self.QUALITY_COLORS["bad"]))
+                    if xyz.shape[0] > 0:
+                        ax.scatter(xyz[:, dim_a], xyz[:, dim_b],
+                                   c=colors, s=2, alpha=0.4,
+                                   label=f"Leg {leg_idx}" if col == 0 else None)
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(ylabel)
+                ax.set_title(f"{solver.replace('_', ' ').title()} — {xlabel}{ylabel}")
+                ax.grid(True)
+                if col == 0:
+                    ax.legend(fontsize=7, markerscale=4)
+        fig.suptitle("Chessboard Dataset — EE Trajectories (colour = error quartile)",
+                     fontsize=11, fontweight="bold")
+        fig.tight_layout()
+        p3 = out / f"{prefix}_ee_trajectories.png"
+        fig.savefig(p3, dpi=150)
+        plt.close(fig)
+        print(f"  Saved → {p3}")
+
+        # ── Figure 4: cross-solver % good comparison (summary bar) ───
+        fig, ax = plt.subplots(figsize=(9, 5))
+        x       = np.arange(4)
+        w       = 0.25
+        offsets = [-w, 0, w]
+        for offset, solver in zip(offsets, self.SOLVERS):
+            pct_good = []
+            for leg_idx in range(4):
+                acc = self.stats[solver][leg_idx]
+                total = acc["good"] + acc["okay"] + acc["bad"]
+                pct_good.append(100.0 * acc["good"] / total if total > 0 else 0.0)
+            bars = ax.bar(x + offset, pct_good, w,
+                          label=solver.replace("_", " ").title(),
+                          color=self.SOLVER_COLORS[solver],
+                          alpha=0.85)
+        ax.set_xticks(x)
+        ax.set_xticklabels(self.LEG_NAMES)
+        ax.set_ylabel("% frames graded GOOD")
+        ax.set_ylim(0, 110)
+        ax.axhline(100, color="grey", linewidth=0.6, linestyle="--")
+        ax.set_title("Solver Comparison — % Good Frames per Leg",
+                     fontsize=11, fontweight="bold")
+        ax.legend()
+        ax.grid(True, axis="y")
+        fig.tight_layout()
+        p4 = out / f"{prefix}_solver_comparison.png"
+        fig.savefig(p4, dpi=150)
+        plt.close(fig)
+        print(f"  Saved → {p4}")
+
+    # ------------------------------------------------------------------
+    def print_summary(self):
+        if self.stats is None:
+            raise RuntimeError("Call analyse() first.")
+
+        print("\n── Chessboard Dataset Summary ───────────────────────────")
+        print(f"  Moves loaded : {len(self.dataset):,}")
+        for solver in self.SOLVERS:
+            print(f"\n  {solver.replace('_', ' ').upper()}")
+            total_g = total_o = total_b = 0
+            for leg_idx in range(4):
+                acc = self.stats[solver][leg_idx]
+                g, o, b = acc["good"], acc["okay"], acc["bad"]
+                t = g + o + b
+                total_g += g; total_o += o; total_b += b
+                pct = 100*g/t if t > 0 else 0
+                e_p = acc["e_pos"]
+                e_o = acc["e_ori"]
+                print(f"    Leg {leg_idx}: good {g:>5,}/{t:,} ({pct:.0f}%)  "
+                      f"e_pos μ={e_p.mean():.4f} σ={e_p.std():.4f}  "
+                      f"e_ori μ={e_o.mean():.4f} σ={e_o.std():.4f}")
+            tt = total_g + total_o + total_b
+            print(f"    TOTAL: good {total_g:,}/{tt:,} "
+                  f"({100*total_g/tt:.1f}%)  "
+                  f"okay {total_o:,}  bad {total_b:,}")
+        print("─────────────────────────────────────────────────────────\n")
+
+    # ------------------------------------------------------------------
+    def run(self, filename: str, out_dir: str = ".", prefix: str = "chess"):
+        self.load(filename)
+        self.analyse()
+        self.print_summary()
+        self.plot(out_dir=out_dir, prefix=prefix)
+
 # ===========================================================================
 # Entry point
 # ===========================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dataset analysis tools")
-    parser.add_argument("--mode",    choices=["approx", "real", "both"],
+    parser.add_argument("--mode",
+                        choices=["approx", "real", "both", "simple_ik", "chess"],
                         default="both",
-                        help="Which analyser to run (default: both)")
+                        help="Which analyser to run  "
+                             "(approx | real | both | simple_ik | chess)")
     parser.add_argument("--load",    type=str, default="training_data",
-                        help="Dataset filename to load for real analysis "
-                             "(no .pkl extension)")
+                        help="Dataset filename (no .pkl extension).  "
+                             "For --mode both/real/approx this is the imitation "
+                             "learning dataset; for simple_ik the simple IK "
+                             "dataset; for chess the chessboard test dataset.")
     parser.add_argument("--frames",  type=int, default=200_000,
                         help="Target waypoints for approximate analysis "
                              "(default: 200000)")
@@ -566,17 +1024,34 @@ if __name__ == "__main__":
         real = RealDatasetAnalyzer(robot=robot, run_fk=not args.no_fk)
         real.run(filename=args.load,
                  out_dir=args.out, prefix="real")
+
+    if args.mode == "simple_ik":
+        sik = SimpleIKDatasetAnalyzer(robot=robot)
+        sik.run(filename=args.load,
+                out_dir=args.out, prefix="simple_ik")
+
+    if args.mode == "chess":
+        chess = ChessboardDatasetAnalyzer(robot=robot)
+        chess.run(filename=args.load,
+                  out_dir=args.out, prefix="chess")
         
 
 
-# # Just the quality histogram, no FK (fast):
-# python dataset_analysis.py --mode real --load training_data --no-fk
-
-# # Full real analysis with FK heatmaps:
-# python dataset_analysis.py --mode real --load training_data
-
-# # Approximate only (no dataset file needed):
-# python dataset_analysis.py --mode approx --frames 200000
-
-# # Both, save figures to a figs/ folder:
-# python dataset_analysis.py --mode both --load training_data --out figs/
+# ── Usage examples ────────────────────────────────────────────────────────
+# Imitation learning dataset (quality histogram only, fast):
+#   python dataset_analysis.py --mode real --load training_data --no-fk
+#
+# Imitation learning dataset (full with FK heatmaps):
+#   python dataset_analysis.py --mode real --load training_data
+#
+# Approximate workspace coverage (no dataset file needed):
+#   python dataset_analysis.py --mode approx --frames 200000
+#
+# Both imitation analyses:
+#   python dataset_analysis.py --mode both --load training_data --out figs/
+#
+# Simple IK dataset:
+#   python dataset_analysis.py --mode simple_ik --load simple_ik_training_data
+#
+# Chessboard test dataset:
+#   python dataset_analysis.py --mode chess --load chessboard_test_dataset --out figs/

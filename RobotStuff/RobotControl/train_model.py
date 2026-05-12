@@ -102,6 +102,14 @@ def train(model: IK,
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     mse       = nn.MSELoss(reduction='none')
 
+    # test what data looks like:
+    batch = dataset.sample(batchsize=4096)
+    X, Y, TW = batch_to_tensors(batch, device)
+    print(f"Y mean: {Y.mean():.4f}")
+    print(f"Y std:  {Y.std():.4f}")
+    print(f"Y min:  {Y.min():.4f}")
+    print(f"Y max:  {Y.max():.4f}")
+
     model.train()
 
     for epoch in range(epochs):
@@ -117,9 +125,12 @@ def train(model: IK,
 
         # Per-sample MSE weighted by target_weight
         loss_per_sample = mse(pred, Y).mean(dim=1, keepdim=True)  # (B, 1)
-        loss = (loss_per_sample * TW).mean()
+        # loss = (loss_per_sample * TW).mean()
+        my_TW = torch.ones(len(TW))
+        loss = (loss_per_sample * my_TW).mean()
 
         loss.backward()
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
@@ -161,7 +172,7 @@ if __name__ == "__main__":
     dataset = my_dataframe(
         my_data_gen=data_gen,
         datapoints_goal=2e5,
-        dataset_filename='training_data',
+        dataset_filename= 'robot_training_data_5_8_26'# 'training_data',
     )
 
     # ── Option A: generate dataset on the fly ────────────────────────
@@ -169,6 +180,9 @@ if __name__ == "__main__":
 
     # ── Option B: load a pre-generated dataset ───────────────────────
     # dataset.load_dataset('robot_training_data_5_8_26')
+
+
+    dataset.load_dataset('training_data')
 
     model = IK(
         robot=robot,
@@ -179,8 +193,8 @@ if __name__ == "__main__":
     train(
         model=model,
         dataset=dataset,
-        epochs=200,
-        batch_size=512,
-        lr=1e-3,
-        save_path="ik_model_hw256_hd4.pt",
+        epochs=int(1e3),
+        batch_size=2048,
+        lr= 1e-3,
+        save_path=f"ik_model_hdim{model.hid_dim}_hdep{model.hid_layers}.pt",
     )

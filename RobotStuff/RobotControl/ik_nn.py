@@ -42,6 +42,9 @@ class IK(nn.Module):
         self.n          = len(self.robot.a)
         self.input_dim  = (2 * self.n) + 3 + 6  # 2×joints + xyz + 6D orientation
         self.output_dim = self.n
+        self.hid_dim = hid_dim
+        self.hid_layers = hid_layers
+
 
         # ── Build layers ──────────────────────────────────────────────
         layer_list = []
@@ -102,7 +105,10 @@ class IK(nn.Module):
         rot_to_targ_SO3 = goal_ori_SO3.T @ current_ori_SO3
         rot_6D          = to_6D_R(rot_to_targ_SO3)
 
-        return torch.cat([delta_q_N, q_N, dist_N, rot_6D])  # (input_dim,)
+        # Loss_Math and Robot_math operate in float64; cast the merged
+        # vector to float32 here — the single point where all inputs meet —
+        # so the network (float32) never sees a dtype mismatch.
+        return torch.cat([delta_q_N, q_N, dist_N, rot_6D]).to(torch.float32)  # (input_dim,)
 
     def solve_IK(self,
                  delta_q_prev: torch.Tensor,
@@ -129,11 +135,7 @@ class IK(nn.Module):
         with torch.no_grad():
             delta_q_N = self.forward(x.unsqueeze(0)).squeeze(0)  # (n,)
 
-        # Network output is in [-1, 1] normalised velocity space.
-        # Invert get_normal_joint_vel: nv = 2*(dq - q_l)/(q_h - q_l) - 1
-        # → dq = (nv + 1) / 2 * (q_h - q_l) + q_l
-        q_l = self.L.q_l
-        q_h = self.L.q_h
-        delta_q = (delta_q_N + 1.0) / 2.0 * (q_h - q_l) + q_l
-
-        return delta_q
+        q_curr_N    = self.L.get_normal_joint_value(q_curr)                 # (n,)
+        q_pred_N    = (q_curr_N + delta_q_N).clamp(-1.0, 1.0)              # (n,) stay in range
+        real_pose   = self.L.get_original_joint_value(q_norm=q_pred_N)     # (n,)
+        return real_pose

@@ -69,6 +69,37 @@ def to_6D_R(R: torch.Tensor) -> torch.Tensor:
     return torch.cat([R[:, 0], R[:, 1]])  # (6,)  — stays on same device as R
 
 
+def to_6D_R_batch(R: torch.Tensor) -> torch.Tensor:
+    """
+    Batched version of to_6D_R.
+
+    R   : (B, 3, 3)
+    returns : (B, 6)  — first two columns of each matrix, concatenated
+    """
+    R = R.to(torch.float64)
+    return torch.cat([R[:, :, 0], R[:, :, 1]], dim=1)  # (B, 6)
+
+
+def to_SO3_batch(r6d: torch.Tensor) -> torch.Tensor:
+    """
+    Batched version of to_SO3.  Gram-Schmidt orthonormalisation over a batch.
+
+    r6d : (B, 6)
+    returns : (B, 3, 3)
+    """
+    r6d = r6d.to(torch.float64)
+    a1 = r6d[:, :3]   # (B, 3)
+    a2 = r6d[:, 3:6]  # (B, 3)
+
+    b1 = a1 / torch.linalg.vector_norm(a1, dim=1, keepdim=True)           # (B, 3)
+    dot = (b1 * a2).sum(dim=1, keepdim=True)                               # (B, 1)
+    b2 = a2 - dot * b1
+    b2 = b2 / torch.linalg.vector_norm(b2, dim=1, keepdim=True)           # (B, 3)
+    b3 = torch.linalg.cross(b1, b2, dim=1)                                # (B, 3)
+
+    return torch.stack([b1, b2, b3], dim=2)  # (B, 3, 3)  — columns of R
+
+
 def to_SO3(r6d: torch.Tensor) -> torch.Tensor:
     """
     Recover a 3x3 SO3 rotation matrix from a 6D representation.
