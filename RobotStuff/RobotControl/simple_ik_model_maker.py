@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from forward_kinematics import Robot_math
 from loss_math import Loss_Math
-from rot_math import to_6D_R
+from rot_math import to_6D_R, to_6D_R_batch
 
 
 class simpleIK(nn.Module):
@@ -32,6 +32,9 @@ class simpleIK(nn.Module):
         self.n          = len(robot.bounds)          # number of joints
         self.input_dim  = self.n + 3 + 6            # q_N + dist_N(3) + rot_6D(6)
         self.output_dim = self.n                     # delta_q_N
+
+        self.hid_dim = hid_dim
+        self.hid_layers = hid_layers
 
         # ── Build layers ──────────────────────────────────────────────
         layers = [nn.Linear(self.input_dim, hid_dim), nn.ReLU()]
@@ -53,6 +56,7 @@ class simpleIK(nn.Module):
         x : (B, input_dim)  — already-normalised input vector
         returns delta_q_N : (B, n)  in [-1, 1]
         '''
+        x = x.to(torch.float32)
         return self.net(x)
 
     # ------------------------------------------------------------------
@@ -101,15 +105,18 @@ class simpleIK(nn.Module):
         # ── Normalise joint angles ──────────────────────────────────
         # get_normal_joint_value must accept (B, n) and return (B, n)
         q_N = self.L.get_normal_joint_value(q_batch)                        # (B, n)
+        q_N = q_N.to(torch.float32)
 
         # ── Batched FK ──────────────────────────────────────────────
         curr_xyz_batch, curr_SO3_batch = self._batched_fk(q_batch)          # (B,3), (B,3,3)
+        curr_xyz_batch = curr_xyz_batch.to(torch.float32)
+        curr_SO3_batch = curr_SO3_batch.to(torch.float32)
 
         # ── Normalise distance to goal ──────────────────────────────
         # get_normal_dist_to_goal must accept (B,3),(B,3) and return (B,3)
         dist_N = self.L.get_normal_dist_to_goal(
                      pos_curr=curr_xyz_batch,
-                     pos_G_ws=goal_xyz_batch)                                # (B, 3)
+                     pos_G_ws=goal_xyz_batch).to(torch.float32)             # (B, 3)
 
         # ── 6D rotation representation ──────────────────────────────
         # rot_to_targ[i] = goal_SO3[i].T @ curr_SO3[i]
@@ -120,7 +127,7 @@ class simpleIK(nn.Module):
         )                                                                    # (B, 3, 3)
 
         # to_6D_R must accept (B, 3, 3) and return (B, 6)  — first two cols of R, row-major
-        rot_6D = to_6D_R(rot_to_targ)                                       # (B, 6)
+        rot_6D = to_6D_R_batch(rot_to_targ)                                       # (B, 6)
 
         return torch.cat([q_N, dist_N, rot_6D], dim=1)                      # (B, input_dim)
 
@@ -198,14 +205,16 @@ class simpleIK(nn.Module):
         X          = self.build_input_batch(q_batch, goal_xyz_batch, goal_SO3_batch)  # (B, input_dim)
         delta_q_N  = self.forward(X)                                                   # (B, n)
 
-        q_curr_N   = self.L.get_normal_joint_value(q_batch)                           # (B, n)
-        q_pred_N   = (q_curr_N + delta_q_N).clamp(-1.0, 1.0)                         # (B, n)
-        q_pred     = self.L.get_original_joint_value(q_norm=q_pred_N)                 # (B, n)
+        # Loss_Math / Robot_math operate in float64; cast each output back to
+        # float32 immediately so the entire backward graph stays uniform.
+        q_curr_N   = self.L.get_normal_joint_value(q_batch).to(torch.float32)            # (B, n)
+        q_pred_N   = (q_curr_N + delta_q_N).clamp(-1.0, 1.0)                            # (B, n) stay in range
+        q_pred     = self.L.get_original_joint_value(q_norm=q_pred_N).to(torch.float32)  # (B, n)
 
-        pred_xyz, pred_SO3 = self._batched_fk(q_pred)                                 # (B,3), (B,3,3)
+        pred_xyz, pred_SO3 = self._batched_fk(q_pred)                                    # (B,3), (B,3,3)
 
-        pred_SO3_flat = pred_SO3.reshape(pred_SO3.shape[0], -1)                       # (B, 9)
-        return torch.cat([pred_xyz, pred_SO3_flat], dim=1)                            # (B, 12)
+        pred_SO3_flat = pred_SO3.reshape(pred_SO3.shape[0], -1).to(torch.float32)        # (B, 9)
+        return torch.cat([pred_xyz.to(torch.float32), pred_SO3_flat], dim=1)             # (B, 12)
 
     # ------------------------------------------------------------------
     # Single-sample inference convenience (unchanged interface)

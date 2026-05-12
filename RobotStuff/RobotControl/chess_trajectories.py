@@ -76,9 +76,12 @@ class chess_coords:
 
         center_offset_x = square_x/2
         center_offset_y = square_y/2
+
+        x_start = self.a1_x + center_offset_x
+        y_start = self.a1_y + center_offset_y
         
-        self.x_coords = torch.linspace(start= self.a1_x, end= center_offset_x * 7, steps= 8)
-        self.y_coords = torch.linspace(start= self.a1_y, end= center_offset_y * 7, steps= 8)
+        self.x_coords = torch.linspace(start= x_start, end= square_x * 7, steps= 8)
+        self.y_coords = torch.linspace(start= y_start, end= square_y * 7, steps= 8)
 
         print(f'x center of squares = {self.x_coords}')
         print(f'y center of squares = {self.y_coords}')
@@ -95,7 +98,7 @@ class chess_coords:
 
 
 
-    def make_random_traj_points(self):
+    def make_random_waypoints(self):
         rand_piece = random.choice(self.piece_list_w)
         
         rand_row1 = random.choice(self.row_names)

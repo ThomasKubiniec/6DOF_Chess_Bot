@@ -175,8 +175,8 @@ if __name__ == "__main__":
     train(
         model=model,
         dataset=data_gen,
-        epochs=1000,
+        epochs=int(1e5),
         batch_size=2048,
-        lr=1e-3,
+        lr=1e-4,
         save_path=f"simp_ik_model_hdim{model.hid_dim}_hdep{model.hid_layers}.pt",
     )

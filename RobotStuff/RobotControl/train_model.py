@@ -186,14 +186,14 @@ if __name__ == "__main__":
 
     model = IK(
         robot=robot,
-        hid_dim=64,
-        hid_layers=3,
+        hid_dim=256,
+        hid_layers=4,
     )
 
     train(
         model=model,
         dataset=dataset,
-        epochs=1000,
+        epochs=int(1e3),
         batch_size=2048,
         lr= 1e-3,
         save_path=f"ik_model_hdim{model.hid_dim}_hdep{model.hid_layers}.pt",
