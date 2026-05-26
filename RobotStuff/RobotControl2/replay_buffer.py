@@ -1,78 +1,97 @@
 """
-HER Replay Buffer for the TD3 Robot Arm Agent.
+HER Replay Buffer for the TD3 Robot Arm Agent — optimised for GPU training.
 
-Episodes are stored in a temporary episode buffer as raw transitions.
-At the end of each episode, finish_episode() is called. For every step t
-in the episode it:
+Key design changes vs previous version
+---------------------------------------
+1. Pre-allocated tensor storage (GPU-resident)
+   Transitions are stored as columns in large pre-allocated float32 tensors
+   on the training device rather than as a deque of namedtuples.
+   This eliminates list(deque) conversion and torch.stack on every sample.
 
-  1. Computes the REAL reward using the actual goal and stores that
-     transition in the main replay buffer.
+2. O(1) sampling via index array
+   random.sample on a deque is O(n).  We maintain a flat index array and
+   sample indices directly, then gather from the pre-allocated tensors.
 
-  2. With probability her_ratio, also stores a HER transition: a future
-     achieved state from the same episode is picked as the relabelled goal
-     (FUTURE strategy), the reward is recomputed as if that were always the
-     goal, and done=True is set for the relabelled terminal step.
+3. CPU->GPU transfer eliminated
+   All stored tensors live on the target device.  Batches are sliced
+   directly — zero copy, zero transfer overhead at sample time.
 
-her_ratio decays linearly from her_ratio_start to her_ratio_end over
-her_decay_steps calls to finish_episode(), giving dense relabelling early
-in training when the buffer is sparse, tapering to light relabelling once
-the policy is competent.
+4. FK-free reward recomputation in finish_episode
+   raw transitions already carry pos_next / R_next from the environment
+   step, so reward() no longer needs to re-run FK internally.  We call
+   the reward terms directly using the cached poses.
 
-HER goal selection strategy: FUTURE (Andrychowicz et al., 2017) --
-the relabelled goal is sampled uniformly from steps {t+1, ..., T-1} of
-the same episode.
+5. float32 storage
+   Stored as float32 (matching network dtype) to halve VRAM and improve
+   memory bandwidth during sampling.  FK / reward math still uses float64
+   at episode commit time, cast once before storage.
+
+Buffer layout (all on self.device, dtype=torch.float32)
+  _s       : (capacity, state_dim)
+  _a       : (capacity, action_dim)
+  _r       : (capacity,)
+  _s_prime : (capacity, state_dim)
+  _done    : (capacity,)
+
+capacity is buffer_size.  A write pointer wraps around modulo capacity
+(ring buffer), matching the old deque(maxlen=...) semantics.
 """
 
-from collections import deque, namedtuple
+from __future__ import annotations
 import random
 import torch
 
-# Ready-to-train transition stored in the main buffer
-Transition = namedtuple("Transition", ["s", "a", "r", "s_prime", "done"])
-
-# Per-step data cached during a live episode (all CPU float64 tensors)
-RawTransition = namedtuple("RawTransition", [
-    "q_new",         # (n,)   joint angles after action
-    "delta_q_new",   # (n,)   action applied this step
-    "delta_q_prev",  # (n,)   action applied previous step
-    "pos_curr",      # (3,)   EE position BEFORE this step (= s observation)
-    "R_curr",        # (3,3)  EE rotation BEFORE this step
-    "pos_next",      # (3,)   EE position AFTER this step  (= s' observation)
-    "R_next",        # (3,3)  EE rotation AFTER this step
-    "a_norm",        # (n,)   normalised action in [-1, 1]
-    "done",          # bool
-])
+from rewards_math import Reward_Math
 
 
 class Replay_Buffer:
     """
-    Replay buffer with Hindsight Experience Replay (HER, FUTURE strategy)
-    and a linearly decaying HER ratio.
+    GPU-resident replay buffer with HER (FUTURE strategy) and decaying ratio.
 
     Parameters
     ----------
-    buffer_size      : maximum transitions in the main replay buffer
-    reward_math      : Reward_Math instance (used to recompute rewards / states)
-    her_ratio_start  : HER probability at the start of training  (default 0.80)
-    her_ratio_end    : HER probability floor after decay          (default 0.20)
-    her_decay_steps  : number of finish_episode() calls over which to decay
+    buffer_size      : maximum transitions stored  (ring buffer)
+    reward_math      : Reward_Math instance
+    device           : torch.device for stored tensors (should match TD3 device)
+    state_dim        : dimension of state vector
+    action_dim       : number of joints
+    her_ratio_start  : HER probability at episode 0           (default 0.80)
+    her_ratio_end    : HER probability floor                   (default 0.20)
+    her_decay_steps  : episodes over which ratio decays        (default 1000)
     """
 
     def __init__(self,
                  buffer_size:     int,
-                 reward_math,
+                 reward_math:     Reward_Math,
+                 device:          torch.device,
+                 state_dim:       int,
+                 action_dim:      int,
                  her_ratio_start: float = 0.80,
                  her_ratio_end:   float = 0.20,
                  her_decay_steps: int   = 1000):
 
-        self.buffer          = deque(maxlen=buffer_size)
+        self.capacity        = buffer_size
         self.reward_math     = reward_math
+        self.device          = device
+        self.state_dim       = state_dim
+        self.action_dim      = action_dim
         self.her_ratio_start = her_ratio_start
         self.her_ratio_end   = her_ratio_end
         self.her_decay_steps = her_decay_steps
+
+        self._ptr            = 0      # next write position
+        self._size           = 0      # current number of valid entries
         self._episodes_done  = 0
 
-        self._episode_cache: list = []   # list[RawTransition]
+        # Pre-allocated GPU tensors
+        self._s       = torch.zeros(buffer_size, state_dim,  dtype=torch.float32, device=device)
+        self._a       = torch.zeros(buffer_size, action_dim, dtype=torch.float32, device=device)
+        self._r       = torch.zeros(buffer_size,             dtype=torch.float32, device=device)
+        self._s_prime = torch.zeros(buffer_size, state_dim,  dtype=torch.float32, device=device)
+        self._done    = torch.zeros(buffer_size,             dtype=torch.float32, device=device)
+
+        # Episode cache: list of raw step dicts (CPU float64, never touches GPU)
+        self._episode_cache: list[dict] = []
 
     # -------------------------------------------------------------------------
     # Properties
@@ -80,7 +99,6 @@ class Replay_Buffer:
 
     @property
     def her_ratio(self) -> float:
-        """Current HER probability, decaying linearly with episodes completed."""
         t = min(self._episodes_done / max(self.her_decay_steps, 1), 1.0)
         return self.her_ratio_start + t * (self.her_ratio_end - self.her_ratio_start)
 
@@ -98,182 +116,170 @@ class Replay_Buffer:
                  R_next:       torch.Tensor,
                  a_norm:       torch.Tensor,
                  done:         bool):
-        """
-        Cache one environment step during a live episode.
-        Call every step; call finish_episode() once the episode ends.
-
-        Parameters
-        ----------
-        q_new        : joint angles after applying action          (n,)
-        delta_q_new  : joint delta applied this step               (n,)
-        delta_q_prev : joint delta applied the previous step       (n,)
-        pos_curr     : EE position before this step                (3,)
-        R_curr       : EE rotation matrix before this step         (3,3)
-        pos_next     : EE position after this step                 (3,)
-        R_next       : EE rotation matrix after this step          (3,3)
-        a_norm       : normalised action in [-1, 1]                (n,)
-        done         : True if this step ends the episode
-        """
-        self._episode_cache.append(RawTransition(
-            q_new        = self._t(q_new),
-            delta_q_new  = self._t(delta_q_new),
-            delta_q_prev = self._t(delta_q_prev),
-            pos_curr     = self._t(pos_curr),
-            R_curr       = self._t(R_curr),
-            pos_next     = self._t(pos_next),
-            R_next       = self._t(R_next),
-            a_norm       = self._t(a_norm),
-            done         = done,
-        ))
+        """Cache one step.  Call finish_episode() at episode end."""
+        self._episode_cache.append({
+            "q_new":        self._cpu64(q_new),
+            "delta_q_new":  self._cpu64(delta_q_new),
+            "delta_q_prev": self._cpu64(delta_q_prev),
+            "pos_curr":     self._cpu64(pos_curr),
+            "R_curr":       self._cpu64(R_curr),
+            "pos_next":     self._cpu64(pos_next),
+            "R_next":       self._cpu64(R_next),
+            "a_norm":       self._cpu64(a_norm),
+            "done":         done,
+        })
 
     def finish_episode(self,
                        pos_goal:   torch.Tensor,
                        R_goal_SO3: torch.Tensor,
                        use_focal:  bool = True):
         """
-        Process the cached episode and commit transitions to the main buffer.
+        Commit cached episode to the GPU buffer.
 
-        For each step t:
-          1. Stores the real transition with the actual goal and reward.
-          2. With probability her_ratio, stores a HER transition using a
-             randomly selected future achieved pose as the relabelled goal.
+        For each step:
+          1. Real transition  (actual goal, reward computed from cached poses).
+          2. HER transition   (FUTURE goal, with probability her_ratio).
 
-        Clears the episode cache and increments the episode counter.
-
-        Parameters
-        ----------
-        pos_goal   : actual goal EE position for this episode    (3,)
-        R_goal_SO3 : actual goal rotation matrix for this episode (3,3)
-        use_focal  : passed through to Reward_Math.reward()
+        Reward is computed WITHOUT re-running FK: pos_next / R_next are
+        already in the cache, so we call reward terms directly.
         """
         episode  = self._episode_cache
         T        = len(episode)
-        pos_goal = self._t(pos_goal)
-        R_goal   = self._t(R_goal_SO3)
         rm       = self.reward_math
         ratio    = self.her_ratio
 
+        pos_goal = self._cpu64(pos_goal)
+        R_goal   = self._cpu64(R_goal_SO3)
+
         for t, raw in enumerate(episode):
 
-            # ------------------------------------------------------------------
-            # 1. Real transition  (actual goal, actual reward)
-            # ------------------------------------------------------------------
+            # ── 1. Real transition ──────────────────────────────────────────
             s = rm.build_state(
-                pos_curr     = raw.pos_curr,
+                pos_curr     = raw["pos_curr"],
                 pos_goal     = pos_goal,
                 R_goal_SO3   = R_goal,
-                delta_q_prev = raw.delta_q_prev,
+                delta_q_prev = raw["delta_q_prev"],
             )
             s_prime = rm.build_state(
-                pos_curr     = raw.pos_next,
+                pos_curr     = raw["pos_next"],
                 pos_goal     = pos_goal,
                 R_goal_SO3   = R_goal,
-                delta_q_prev = raw.delta_q_new,
+                delta_q_prev = raw["delta_q_new"],
             )
-
-            rm.reset_episode()
-            r_real, _ = rm.reward(
-                q_new        = raw.q_new,
-                delta_q_new  = raw.delta_q_new,
-                delta_q_prev = raw.delta_q_prev,
-                pos_goal     = pos_goal,
-                R_goal_SO3   = R_goal,
-                use_focal    = use_focal,
+            r_real = self._compute_reward_no_fk(
+                raw=raw, pos_goal=pos_goal, R_goal=R_goal,
+                use_focal=use_focal, rm=rm,
             )
+            self._write(s, raw["a_norm"], r_real, s_prime, raw["done"])
 
-            self._store(s, raw.a_norm, r_real, s_prime, raw.done)
-
-            # ------------------------------------------------------------------
-            # 2. HER transition  (FUTURE strategy)
-            # ------------------------------------------------------------------
+            # ── 2. HER transition ───────────────────────────────────────────
             if random.random() < ratio and t < T - 1:
-                # Sample a random future step's achieved pose as the new goal
-                future_idx   = random.randint(t + 1, T - 1)
-                future       = episode[future_idx]
-                her_pos_goal = future.pos_next    # (3,)  achieved EE position
-                her_R_goal   = future.R_next      # (3,3) achieved EE rotation
+                fi           = random.randint(t + 1, T - 1)
+                future       = episode[fi]
+                her_pos_goal = future["pos_next"]
+                her_R_goal   = future["R_next"]
 
                 s_her = rm.build_state(
-                    pos_curr     = raw.pos_curr,
+                    pos_curr     = raw["pos_curr"],
                     pos_goal     = her_pos_goal,
                     R_goal_SO3   = her_R_goal,
-                    delta_q_prev = raw.delta_q_prev,
+                    delta_q_prev = raw["delta_q_prev"],
                 )
                 s_prime_her = rm.build_state(
-                    pos_curr     = raw.pos_next,
+                    pos_curr     = raw["pos_next"],
                     pos_goal     = her_pos_goal,
                     R_goal_SO3   = her_R_goal,
-                    delta_q_prev = raw.delta_q_new,
+                    delta_q_prev = raw["delta_q_new"],
                 )
-
-                # Terminal for the HER transition: this step reaches the
-                # relabelled goal (t == future_idx) or the episode ended.
-                her_done = (t == future_idx) or raw.done
-
-                rm.reset_episode()
-                r_her, _ = rm.reward(
-                    q_new        = raw.q_new,
-                    delta_q_new  = raw.delta_q_new,
-                    delta_q_prev = raw.delta_q_prev,
-                    pos_goal     = her_pos_goal,
-                    R_goal_SO3   = her_R_goal,
-                    use_focal    = use_focal,
+                r_her = self._compute_reward_no_fk(
+                    raw=raw, pos_goal=her_pos_goal, R_goal=her_R_goal,
+                    use_focal=use_focal, rm=rm,
                 )
+                her_done = (t == fi) or raw["done"]
+                self._write(s_her, raw["a_norm"], r_her, s_prime_her, her_done)
 
-                self._store(s_her, raw.a_norm, r_her, s_prime_her, her_done)
-
-        # Housekeeping
         self._episode_cache = []
         self._episodes_done += 1
 
     # -------------------------------------------------------------------------
-    # Sampling API  (unchanged interface for TD3.train_step)
+    # Sampling API
     # -------------------------------------------------------------------------
 
     def sample(self, batch_size: int) -> dict | None:
         """
-        Sample a random mini-batch of ready-to-train transitions.
+        Sample a random mini-batch.  O(batch_size) — no deque conversion.
 
-        Returns a dict with keys 's', 'a', 'r', 's_prime', 'done'
-        (all (B, *) float64 tensors), or None if the buffer is too small.
+        Returns dict of float32 tensors on self.device:
+            s, a, r, s_prime, done  —  shapes (B, state_dim), (B, action_dim),
+                                        (B,), (B, state_dim), (B,)
+        Returns None if buffer has fewer than batch_size transitions.
         """
-        if batch_size > len(self.buffer):
+        if self._size < batch_size:
             return None
 
-        batch = random.sample(list(self.buffer), batch_size)
+        idx = torch.randint(0, self._size, (batch_size,), device=self.device)
 
         return {
-            "s":       torch.stack([t.s       for t in batch]),
-            "a":       torch.stack([t.a       for t in batch]),
-            "r":       torch.stack([t.r       for t in batch]),
-            "s_prime": torch.stack([t.s_prime for t in batch]),
-            "done":    torch.stack([t.done    for t in batch]),
+            "s":       self._s      [idx],
+            "a":       self._a      [idx],
+            "r":       self._r      [idx],
+            "s_prime": self._s_prime[idx],
+            "done":    self._done   [idx],
         }
 
     def __len__(self) -> int:
-        return len(self.buffer)
+        return self._size
 
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------
 
-    def _store(self,
+    def _write(self,
                s:       torch.Tensor,
                a:       torch.Tensor,
-               r:       torch.Tensor,
+               r:       torch.Tensor | float,
                s_prime: torch.Tensor,
-               done):
-        self.buffer.append(Transition(
-            s       = s.detach().cpu(),
-            a       = a.detach().cpu(),
-            r       = r.detach().cpu() if isinstance(r, torch.Tensor)
-                      else torch.tensor(r, dtype=torch.float64),
-            s_prime = s_prime.detach().cpu(),
-            done    = torch.tensor(float(done), dtype=torch.float64),
-        ))
+               done:    bool | float):
+        """Write one transition into the ring buffer at the current pointer."""
+        i = self._ptr
+
+        self._s      [i] = s.to(dtype=torch.float32, device=self.device)
+        self._a      [i] = a.to(dtype=torch.float32, device=self.device)
+        self._r      [i] = float(r.item() if isinstance(r, torch.Tensor) else r)
+        self._s_prime[i] = s_prime.to(dtype=torch.float32, device=self.device)
+        self._done   [i] = float(done)
+
+        self._ptr  = (self._ptr + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def _compute_reward_no_fk(self,
+                               raw:       dict,
+                               pos_goal:  torch.Tensor,
+                               R_goal:    torch.Tensor,
+                               use_focal: bool,
+                               rm:        Reward_Math) -> torch.Tensor:
+        """
+        Compute scalar reward from cached poses, skipping FK.
+
+        Uses pos_next / R_next already in the raw transition dict instead
+        of re-running forward kinematics inside rm.reward().
+        """
+        rm.reset_episode()
+
+        rv_pos, e_pos_raw = rm.r_pos(raw["pos_next"], pos_goal)
+        rv_ori, e_ori_raw = rm.r_ori(raw["R_next"],   R_goal,
+                                      e_pos_raw if use_focal else None)
+        rv_pass           = rm.r_pass(e_pos_raw, e_ori_raw)
+        rv_vel            = rm.r_vel(raw["delta_q_new"])
+        rv_acc            = rm.r_acc(raw["delta_q_new"], raw["delta_q_prev"])
+        rv_crash          = rm.r_crash(raw["q_new"])
+        rv_time           = torch.tensor(-1.0, dtype=torch.float64,
+                                         device=rm.device)
+
+        return rv_pass + rv_pos + rv_ori + rv_vel + rv_acc + rv_crash + rv_time
 
     @staticmethod
-    def _t(x) -> torch.Tensor:
+    def _cpu64(x) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
             return x.detach().to(dtype=torch.float64, device="cpu")
         return torch.tensor(x, dtype=torch.float64)

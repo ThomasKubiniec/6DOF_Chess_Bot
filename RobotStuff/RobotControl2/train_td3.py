@@ -38,7 +38,6 @@ float32 / float64 boundary
   Cast back to float64 before passing to Reward_Math or Robot_math.
 """
 
-import numpy as np
 import argparse
 import copy
 import time
@@ -55,6 +54,7 @@ from rewards_math       import Reward_Math
 from replay_buffer      import Replay_Buffer
 from td3                import TD3
 
+
 # ---------------------------------------------------------------------------
 # Robot definition  -- edit this block for your specific arm
 # ---------------------------------------------------------------------------
@@ -64,29 +64,31 @@ def make_robot(device) -> Robot_math:
     Instantiate your Robot_math here.
     Edit the DH parameters, bounds, and capsule radii to match your arm.
     """
-    my_a     = [0.0, 7.375, 0.0,  0.0,  0.0,  0.0]
-    my_alpha = [np.deg2rad(90),  np.deg2rad(180), np.deg2rad(90),
-                np.deg2rad(90),  np.deg2rad(-90),  np.deg2rad(0)]
-    my_d     = [-3.5, 0.0, 0.0, 8.25, 0.0, 5.1875]
-    my_theta = [np.deg2rad(0),   np.deg2rad(0),   np.deg2rad(90),
-                np.deg2rad(180), np.deg2rad(0),   np.deg2rad(-90)]
-    my_bounds = [
-        (np.deg2rad(-90),  np.deg2rad(90)),
-        (np.deg2rad(-180), np.deg2rad(0)),
-        (np.deg2rad(-90),  np.deg2rad(90)),
-        (np.deg2rad(-90),  np.deg2rad(90)),
-        (np.deg2rad(-90),  np.deg2rad(90)),
-        (np.deg2rad(-90),  np.deg2rad(90)),
+    a     = [0,    0.425, 0.3922, 0,      0,      0     ]
+    alpha = [1.5708, 0,   0,      1.5708, -1.5708, 0     ]
+    d     = [0.1625, 0,   0,      0.1333, 0.0997,  0.0996]
+    theta = [0,    0,     0,      0,      0,       0     ]
+
+    bounds = [
+        (-6.2832, 6.2832),
+        (-6.2832, 6.2832),
+        (-3.1416, 3.1416),
+        (-6.2832, 6.2832),
+        (-6.2832, 6.2832),
+        (-6.2832, 6.2832),
     ]
-    robot = Robot_math(
-        a=my_a, alpha=my_alpha, d=my_d, theta=my_theta,
-        joint_type=["r"] * 6, bounds=my_bounds,
-        fail_dist=[0.1] * 6,
+
+    fail_dist = [0.05] * 6
+    pad_dist  = [0.08] * 6
+
+    return Robot_math(
+        a=a, alpha=alpha, d=d, theta=theta,
+        joint_type=["r"] * 6,
+        bounds=bounds,
+        fail_dist=fail_dist,
+        pad_dist=pad_dist,
         device=device,
     )
-    robot.WT = robot.make_homogenous_transformation(
-        yaw=0, pitch=0, roll=180, x=0, y=0, z=0)
-    return robot
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +106,7 @@ class HParams:
     n_episodes:          int   = 10_000
     max_steps:           int   = 200
     updates_per_episode: int   = 50
-    batch_size:          int   = 256
+    batch_size:          int   = 2048
 
     # Uniform random warmup: for this many total environment steps the actor
     # is bypassed and actions are sampled uniformly from [-1, 1].  TD3 updates
@@ -178,7 +180,7 @@ class TuneConfig:
 # ---------------------------------------------------------------------------
 
 def sample_collision_free_pose(robot: Robot_math,
-                                max_attempts: int = 10000) -> Optional[torch.Tensor]:
+                                max_attempts: int = 100) -> Optional[torch.Tensor]:
     """
     Sample a uniformly random joint configuration that is self-collision free.
     Returns the joint angle tensor (n,) float64, or None if max_attempts exhausted.
@@ -188,7 +190,6 @@ def sample_collision_free_pose(robot: Robot_math,
              + (robot.high_bounds - robot.low_bounds)
              * torch.rand(robot.low_bounds.shape,
                           dtype=torch.float64, device=robot.device))
-        # print(f'q = {q}')
         robot.q_vect = q
         crash, _ = robot.do_fk_and_check_crash()
         if not crash:
@@ -395,6 +396,9 @@ def train(hp:      HParams,
     buffer = Replay_Buffer(
         buffer_size     = hp.buffer_size,
         reward_math     = reward_math,
+        device          = device,
+        state_dim       = state_dim,
+        action_dim      = n_joints,
         her_ratio_start = hp.her_ratio_start,
         her_ratio_end   = hp.her_ratio_end,
         her_decay_steps = hp.her_decay_steps,
@@ -653,7 +657,7 @@ def parse_args():
     p.add_argument("--n_episodes",          type=int,   default=10_000)
     p.add_argument("--max_steps",           type=int,   default=200)
     p.add_argument("--updates_per_episode", type=int,   default=50)
-    p.add_argument("--batch_size",          type=int,   default=256)
+    p.add_argument("--batch_size",          type=int,   default=2048)
     p.add_argument("--start_steps",         type=int,   default=2_000,
                    help="Uniform random steps before actor is used")
     p.add_argument("--decay_expl_noise",    action="store_true",
