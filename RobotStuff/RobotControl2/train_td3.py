@@ -38,6 +38,7 @@ float32 / float64 boundary
   Cast back to float64 before passing to Reward_Math or Robot_math.
 """
 
+import numpy as np
 import argparse
 import copy
 import time
@@ -54,7 +55,6 @@ from rewards_math       import Reward_Math
 from replay_buffer      import Replay_Buffer
 from td3                import TD3
 
-
 # ---------------------------------------------------------------------------
 # Robot definition  -- edit this block for your specific arm
 # ---------------------------------------------------------------------------
@@ -64,31 +64,29 @@ def make_robot(device) -> Robot_math:
     Instantiate your Robot_math here.
     Edit the DH parameters, bounds, and capsule radii to match your arm.
     """
-    a     = [0,    0.425, 0.3922, 0,      0,      0     ]
-    alpha = [1.5708, 0,   0,      1.5708, -1.5708, 0     ]
-    d     = [0.1625, 0,   0,      0.1333, 0.0997,  0.0996]
-    theta = [0,    0,     0,      0,      0,       0     ]
-
-    bounds = [
-        (-6.2832, 6.2832),
-        (-6.2832, 6.2832),
-        (-3.1416, 3.1416),
-        (-6.2832, 6.2832),
-        (-6.2832, 6.2832),
-        (-6.2832, 6.2832),
+    my_a     = [0.0, 7.375, 0.0,  0.0,  0.0,  0.0]
+    my_alpha = [np.deg2rad(90),  np.deg2rad(180), np.deg2rad(90),
+                np.deg2rad(90),  np.deg2rad(-90),  np.deg2rad(0)]
+    my_d     = [-3.5, 0.0, 0.0, 8.25, 0.0, 5.1875]
+    my_theta = [np.deg2rad(0),   np.deg2rad(0),   np.deg2rad(90),
+                np.deg2rad(180), np.deg2rad(0),   np.deg2rad(-90)]
+    my_bounds = [
+        (np.deg2rad(-90),  np.deg2rad(90)),
+        (np.deg2rad(-180), np.deg2rad(0)),
+        (np.deg2rad(-90),  np.deg2rad(90)),
+        (np.deg2rad(-90),  np.deg2rad(90)),
+        (np.deg2rad(-90),  np.deg2rad(90)),
+        (np.deg2rad(-90),  np.deg2rad(90)),
     ]
-
-    fail_dist = [0.05] * 6
-    pad_dist  = [0.08] * 6
-
-    return Robot_math(
-        a=a, alpha=alpha, d=d, theta=theta,
-        joint_type=["r"] * 6,
-        bounds=bounds,
-        fail_dist=fail_dist,
-        pad_dist=pad_dist,
+    robot = Robot_math(
+        a=my_a, alpha=my_alpha, d=my_d, theta=my_theta,
+        joint_type=["r"] * 6, bounds=my_bounds,
+        fail_dist=[0.1] * 6,
         device=device,
     )
+    robot.WT = robot.make_homogenous_transformation(
+        yaw=0, pitch=0, roll=180, x=0, y=0, z=0)
+    return robot
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +178,7 @@ class TuneConfig:
 # ---------------------------------------------------------------------------
 
 def sample_collision_free_pose(robot: Robot_math,
-                                max_attempts: int = 100) -> Optional[torch.Tensor]:
+                                max_attempts: int = 10000) -> Optional[torch.Tensor]:
     """
     Sample a uniformly random joint configuration that is self-collision free.
     Returns the joint angle tensor (n,) float64, or None if max_attempts exhausted.
@@ -190,6 +188,7 @@ def sample_collision_free_pose(robot: Robot_math,
              + (robot.high_bounds - robot.low_bounds)
              * torch.rand(robot.low_bounds.shape,
                           dtype=torch.float64, device=robot.device))
+        # print(f'q = {q}')
         robot.q_vect = q
         crash, _ = robot.do_fk_and_check_crash()
         if not crash:
