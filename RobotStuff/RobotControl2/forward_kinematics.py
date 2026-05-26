@@ -47,8 +47,8 @@ class Robot_math:
 
         self.fail_dist_vect = (torch.tensor(fail_dist, dtype=torch.float64, device=self.device)
                                if fail_dist is not None else None)
-        self.pad_dist_vect  = (torch.tensor(pad_dist,  dtype=torch.float64, device=self.device)
-                               if pad_dist  is not None else None)
+        # self.pad_dist_vect  = (torch.tensor(pad_dist,  dtype=torch.float64, device=self.device)
+        #                        if pad_dist  is not None else None)
 
         self.q_vect = torch.zeros(len(a), dtype=torch.float64, device=self.device)
 
