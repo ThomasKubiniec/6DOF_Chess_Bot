@@ -2,62 +2,85 @@
 Training script for the TD3 Robot Arm IK Agent — vectorised K-environment loop.
 
 ────────────────────────────────────────────────────────────────────────────
-Usage
+HOW TO RUN THIS PROGRAM
 ────────────────────────────────────────────────────────────────────────────
 
-  # Plain training run:
-  python train.py --mode train
+1. HYPERPARAMETER TUNING  (run this first)
+   ----------------------------------------
+   Runs N Optuna trials, each a full 10k-episode training run.
+   Saves the best hyperparameters to best_params.json when done.
 
-  # Optuna hyperparameter search (sequential GPU trials):
-  python train.py --mode tune --parallel_mode gpu
+     python train.py --mode tune --n_trials 50
 
-  # Optuna search (parallel CPU trials):
-  python train.py --mode tune --parallel_mode cpu --n_jobs 4
+   To watch the live Optuna dashboard during tuning, open a second
+   terminal and run:
 
-  # Launch the Optuna dashboard:
-  python train.py --mode dashboard
+     python train.py --mode dashboard
 
-────────────────────────────────────────────────────────────────────────────
-Vectorised environment design
-────────────────────────────────────────────────────────────────────────────
+   The dashboard will be at http://localhost:8080 in your browser.
+   It shows optimization history, parameter importance, parallel
+   coordinates, and convergence plots.
 
-Instead of running one episode at a time, K environments run in lockstep.
-Every "step" of the outer loop:
+   To tune on CPU with parallel workers instead of sequential GPU:
 
-  1. One batched actor forward pass over K states  →  (K, n) actions.
-  2. One batched FK call  →  (K, 3) pos_next, (K, 3, 3) R_next.
-  3. Batched reward computation using reward_batch().
-  4. Per-environment done check (success / crash / timeout).
-  5. Any finished environment immediately resets:
-       - its episode cache is committed to the buffer via finish_episode()
-       - new collision-free start and goal are sampled
-  6. After every step, run updates_per_episode/K TD3 gradient updates
-     (amortised so total updates per "episode equivalent" stays constant).
+     python train.py --mode tune --parallel_mode cpu --n_jobs 4
 
-This turns K sequential FK calls into one batched bmm, K sequential
-actor forward passes into one GPU matrix multiply, etc.  The speedup
-is roughly K× for FK and actor inference.
+   To fix specific parameters and only tune the rest:
 
-Collision checking (--check_collisions flag)
-  When enabled, start/goal sampling and per-step crash detection use
-  do_fk_and_check_crash() sequentially (one Robot_math instance, one
-  q_vect at a time).  This is the only part that stays sequential.
-  When disabled (default), sampling uses uniform random joint angles
-  without collision validation — appropriate when self-collisions are
-  geometrically unlikely with your robot parameters.
+     python train.py --mode tune --no_tune_hidden_width --no_tune_hidden_depth
 
-float32 / float64 boundary
-  FK and reward math use float64 for numerical precision.
-  Network inputs/outputs and buffer storage are float32 for GPU speed.
-  Conversion happens in vectorised_step() at the FK→network boundary.
+2. TRAINING WITH TUNED PARAMETERS
+   ---------------------------------
+   After tuning, load the saved best parameters for the final training run:
+
+     python train.py --mode train --load_params best_params.json
+
+   To train with default hyperparameters (no tuning file):
+
+     python train.py --mode train
+
+   To enable self-collision checking during training (slower but physically
+   accurate — recommended for phase 2 / fine-tuning):
+
+     python train.py --mode train --load_params best_params.json --check_collisions
+
+3. DASHBOARD (view a previous or ongoing study)
+   -----------------------------------------------
+     python train.py --mode dashboard
+     python train.py --mode dashboard --storage_path my_study.db --dashboard_port 8080
+
+4. FULL OPTION REFERENCE
+   -----------------------
+   --mode              train | tune | dashboard        (default: train)
+   --load_params       path to JSON file from tuning   (default: none)
+   --check_collisions  flag: enable capsule collision   (default: off)
+   --n_episodes        number of training episodes      (default: 10000)
+   --max_steps         max timesteps per episode        (default: 200)
+   --updates_per_episode TD3 gradient steps per episode (default: 50)
+   --batch_size        replay buffer sample size        (default: 2048)
+   --n_envs            parallel environments K          (default: 8)
+   --start_steps       uniform random warmup steps      (default: 2000)
+   --decay_expl_noise  flag: decay sigma over training  (default: off)
+   --n_trials          Optuna trials                    (default: 50)
+   --storage_path      SQLite file for Optuna study     (default: optuna_study.db)
+   --dashboard_port    port for Optuna dashboard        (default: 8080)
+   --parallel_mode     gpu | cpu  (for tuning)          (default: gpu)
+   --n_jobs            CPU workers for parallel tuning  (default: 4)
+   --no_tune_X         fix parameter X at its default   (e.g. --no_tune_hidden_width)
+
+   Tuneable parameters: gamma, tau, actor_lr, critic_lr, hidden_width,
+   hidden_depth, n_envs, pos_w, rot_w, vel_lambda, acc_lambda,
+   her_ratio_start, her_decay_steps, expl_sigma, expl_sigma_end, target_sigma
 """
 
 import argparse
 import copy
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional
 
+import numpy as np
 import torch
 import optuna
 import optuna_dashboard
@@ -67,10 +90,9 @@ from rewards_math       import Reward_Math
 from replay_buffer      import Replay_Buffer
 from td3                import TD3
 
-import numpy as np
 
 # ---------------------------------------------------------------------------
-# Robot definition  -- edit this block for your specific arm
+# Robot definition
 # ---------------------------------------------------------------------------
 
 def make_robot(device) -> Robot_math:
@@ -110,8 +132,8 @@ class HParams:
     max_steps:           int   = 200
     updates_per_episode: int   = 50
     batch_size:          int   = 2048
-    n_envs:              int   = 8       # parallel environments
-    start_steps:         int   = 2_000   # uniform random steps before actor
+    n_envs:              int   = 8
+    start_steps:         int   = 2_000
 
     # TD3
     gamma:               float = 0.99
@@ -149,6 +171,23 @@ class HParams:
     buffer_size:         int   = 1_000_000
 
 
+def save_params(hp: HParams, path: str):
+    with open(path, "w") as f:
+        json.dump(asdict(hp), f, indent=2)
+    print(f"[Params] Saved to {path}")
+
+
+def load_params(path: str, base: HParams) -> HParams:
+    with open(path) as f:
+        d = json.load(f)
+    hp = copy.deepcopy(base)
+    for k, v in d.items():
+        if hasattr(hp, k):
+            setattr(hp, k, v)
+    print(f"[Params] Loaded from {path}")
+    return hp
+
+
 @dataclass
 class TuneConfig:
     gamma:           bool = True
@@ -157,7 +196,7 @@ class TuneConfig:
     critic_lr:       bool = True
     hidden_width:    bool = False
     hidden_depth:    bool = False
-    n_envs:          bool = False   # architecture-level; off by default
+    n_envs:          bool = False
     pos_w:           bool = True
     rot_w:           bool = True
     vel_lambda:      bool = True
@@ -170,189 +209,123 @@ class TuneConfig:
 
 
 # ---------------------------------------------------------------------------
-# Pose sampling helpers
+# Pose sampling
 # ---------------------------------------------------------------------------
 
 def sample_random_q(robot: Robot_math, K: int) -> torch.Tensor:
-    """
-    Sample K joint configurations uniformly within joint limits.
-    No collision checking — pure GPU tensor op.
-    Returns (K, n) float64 on robot.device.
-    """
-    low  = robot.low_bounds.unsqueeze(0)    # (1, n)
-    high = robot.high_bounds.unsqueeze(0)   # (1, n)
+    low  = robot.low_bounds.unsqueeze(0)
+    high = robot.high_bounds.unsqueeze(0)
     return low + (high - low) * torch.rand(
         K, len(robot.a), dtype=torch.float64, device=robot.device)
 
 
-def sample_random_q_collision_free(robot: Robot_math,
-                                    K: int,
-                                    max_attempts: int = 200) -> torch.Tensor:
-    """
-    Sample K collision-free joint configurations sequentially.
-    Used only when --check_collisions is set.
-    Returns (K, n) float64 on robot.device.
-    """
+def sample_random_q_collision_free(robot: Robot_math, K: int) -> torch.Tensor:
     results = []
     while len(results) < K:
-        q = (robot.low_bounds
-             + (robot.high_bounds - robot.low_bounds)
+        q = (robot.low_bounds + (robot.high_bounds - robot.low_bounds)
              * torch.rand(len(robot.a), dtype=torch.float64, device=robot.device))
         robot.q_vect = q
         crash, _ = robot.do_fk_and_check_crash()
         if not crash:
             results.append(q)
-    return torch.stack(results)   # (K, n)
+    return torch.stack(results)
 
 
 def batch_ee_pose(robot: Robot_math, q_batch: torch.Tensor):
-    """
-    Batched EE pose from joint configs.
-    q_batch : (K, n)
-    returns : pos (K, 3) float64,  R (K, 3, 3) float64
-    """
-    pos = robot.give_ds_batch(q_batch)    # (K, 3)
-    R   = robot.give_Rs_batch(q_batch)    # (K, 3, 3)
-    return pos, R
+    return robot.give_ds_batch(q_batch), robot.give_Rs_batch(q_batch)
 
 
 # ---------------------------------------------------------------------------
-# Vectorised environment state container
+# Vectorised environment state
 # ---------------------------------------------------------------------------
 
 class VecEnvState:
-    """
-    Holds the mutable per-environment state for K parallel environments.
-    All tensors are float64 on robot.device (FK precision).
-    """
     def __init__(self, K: int, n: int, device: torch.device):
-        self.K      = K
-        self.n      = n
-        self.device = device
-
-        # Current joint config, EE pose
-        self.q_curr    = torch.zeros(K, n,    dtype=torch.float64, device=device)
-        self.pos_curr  = torch.zeros(K, 3,    dtype=torch.float64, device=device)
-        self.R_curr    = torch.zeros(K, 3, 3, dtype=torch.float64, device=device)
-
-        # Goal pose
-        self.pos_goal  = torch.zeros(K, 3,    dtype=torch.float64, device=device)
-        self.R_goal    = torch.zeros(K, 3, 3, dtype=torch.float64, device=device)
-
-        # Previous action (for acceleration reward)
-        self.delta_q_prev = torch.zeros(K, n, dtype=torch.float64, device=device)
-
-        # Per-environment step counter
-        self.steps     = torch.zeros(K, dtype=torch.long, device=device)
-
-        # Per-environment episode caches (list of K lists)
+        self.K, self.n, self.device = K, n, device
+        self.q_curr       = torch.zeros(K, n,    dtype=torch.float64, device=device)
+        self.pos_curr     = torch.zeros(K, 3,    dtype=torch.float64, device=device)
+        self.R_curr       = torch.zeros(K, 3, 3, dtype=torch.float64, device=device)
+        self.pos_goal     = torch.zeros(K, 3,    dtype=torch.float64, device=device)
+        self.R_goal       = torch.zeros(K, 3, 3, dtype=torch.float64, device=device)
+        self.delta_q_prev = torch.zeros(K, n,    dtype=torch.float64, device=device)
+        self.steps        = torch.zeros(K,       dtype=torch.long,    device=device)
+        self.ep_reward    = torch.zeros(K,       dtype=torch.float64, device=device)
+        # Per-env episode caches committed to the buffer at episode end
         self.caches: list[list[dict]] = [[] for _ in range(K)]
-
-        # Logging accumulators (reset per episode, tracked per env)
-        self.ep_reward  = torch.zeros(K, dtype=torch.float64, device=device)
-        self.ep_success = [False] * K
-        self.ep_grade   = ["FAIL"] * K
-        self.ep_crashed = [False] * K
 
 
 # ---------------------------------------------------------------------------
 # Vectorised step
 # ---------------------------------------------------------------------------
 
-def vectorised_step(
-        env:          VecEnvState,
-        robot:        Robot_math,
-        reward_math:  Reward_Math,
-        td3:          TD3,
-        buffer:       Replay_Buffer,
-        hp:           HParams,
-        total_steps:  int,
-        update_step:  int,
-        check_collisions: bool,
-        current_sigma: float,
-        episode_log:  list,
-) -> tuple[int, int]:
+def vectorised_step(env:              VecEnvState,
+                    robot:            Robot_math,
+                    reward_math:      Reward_Math,
+                    td3:              TD3,
+                    buffer:           Replay_Buffer,
+                    hp:               HParams,
+                    total_steps:      int,
+                    update_step:      int,
+                    check_collisions: bool,
+                    current_sigma:    float,
+                    episode_log:      list) -> tuple[int, int]:
     """
-    Advance all K environments by one step.
-
-    Returns (total_steps, update_step) updated.
+    Advance all K environments by one timestep.
+    Returns updated (total_steps, update_step).
     """
-    K = env.K
-    n = env.n
+    K      = env.K
+    n      = env.n
     device = robot.device
 
-    # ------------------------------------------------------------------
-    # 1. Build batched state  (K, state_dim)  float64 -> float32 for net
-    # ------------------------------------------------------------------
-    # Normalised displacement to goal per env: (K, 3)
-    norm_dist = (env.pos_goal - env.pos_curr) / reward_math.rob.max_reach
+    # ── 1. Build batched state (K, S) — pure tensor ops ───────────────────
+    norm_dist = (env.pos_goal - env.pos_curr) / reward_math.rob.max_reach  # (K,3)
+    rot_6d    = torch.cat([env.R_goal[:, :, 0],
+                            env.R_goal[:, :, 1]], dim=1)                    # (K,6)
+    vel_low   = robot.low_bounds  - robot.high_bounds                       # (n,)
+    vel_high  = robot.high_bounds - robot.low_bounds                        # (n,)
+    denom     = (vel_high - vel_low).clamp(min=1e-8)
+    prev_vel  = 2.0 * ((env.delta_q_prev - vel_low) / denom) - 1.0        # (K,n)
+    state_f64 = torch.cat([norm_dist, rot_6d, prev_vel], dim=1)            # (K,S)
+    state_f32 = state_f64.to(dtype=torch.float32, device=td3.device)
 
-    # 6D rotation representation of goal per env: (K, 6)
-    rot_6d = torch.cat([env.R_goal[:, :, 0],
-                         env.R_goal[:, :, 1]], dim=1)          # (K, 6)
-
-    # Previous normalised velocity: (K, n)
-    vel_low  = robot.low_bounds  - robot.high_bounds            # (n,)
-    vel_high = robot.high_bounds - robot.low_bounds             # (n,)
-    denom    = (vel_high - vel_low).clamp(min=1e-8)
-    prev_vel_norm = 2.0 * ((env.delta_q_prev - vel_low) / denom) - 1.0  # (K, n)
-
-    state_f64 = torch.cat([norm_dist, rot_6d, prev_vel_norm], dim=1)    # (K, S)
-    state_f32 = state_f64.to(dtype=torch.float32, device=td3.device)    # GPU f32
-
-    # ------------------------------------------------------------------
-    # 2. Select actions  (K, n)
-    # ------------------------------------------------------------------
-    uniform_random = (total_steps < hp.start_steps)
-
-    if uniform_random:
+    # ── 2. Select actions ─────────────────────────────────────────────────
+    if total_steps < hp.start_steps:
         a_norm_f32 = torch.rand(K, n, dtype=torch.float32, device=td3.device) * 2 - 1
     else:
         with torch.no_grad():
-            a_norm_f32 = td3.actor(state_f32)                  # (K, n)
-        # Add clipped Gaussian exploration noise
-        noise = torch.randn_like(a_norm_f32) * current_sigma
-        noise = noise.clamp(-hp.expl_clip, hp.expl_clip)
+            a_norm_f32 = td3.actor(state_f32)
+        noise      = (torch.randn_like(a_norm_f32) * current_sigma
+                      ).clamp(-hp.expl_clip, hp.expl_clip)
         a_norm_f32 = (a_norm_f32 + noise).clamp(-1.0, 1.0)
 
     a_norm_f64 = a_norm_f32.to(dtype=torch.float64, device=device)
 
-    # ------------------------------------------------------------------
-    # 3. Apply actions to get new joint configs  (K, n)
-    # ------------------------------------------------------------------
-    # Normalise current q to [-1, 1], add normalised delta, clamp, denorm
-    q_range = robot.high_bounds - robot.low_bounds              # (n,)
-    q_norm  = 2.0 * ((env.q_curr - robot.low_bounds) / q_range.clamp(min=1e-8)) - 1.0
+    # ── 3. Apply actions ──────────────────────────────────────────────────
+    q_range    = robot.high_bounds - robot.low_bounds
+    q_norm     = 2.0 * ((env.q_curr - robot.low_bounds) / q_range.clamp(min=1e-8)) - 1.0
     q_new_norm = (q_norm + a_norm_f64).clamp(-1.0, 1.0)
-    q_new  = robot.low_bounds + (q_new_norm + 1.0) * q_range / 2.0  # (K, n)
+    q_new      = robot.low_bounds + (q_new_norm + 1.0) * q_range / 2.0    # (K,n)
+    delta_q    = reward_math.denormalize_from_range(
+        a_norm_f64,
+        vel_low.unsqueeze(0).expand(K, -1),
+        vel_high.unsqueeze(0).expand(K, -1))                               # (K,n)
 
-    # Denormalise action to real velocity units (for reward/buffer)
-    delta_q_new = reward_math.denormalize_from_range(
-        a_norm_f64, vel_low.unsqueeze(0).expand(K, -1),
-        vel_high.unsqueeze(0).expand(K, -1))                    # (K, n)
+    # ── 4. Batched FK ─────────────────────────────────────────────────────
+    pos_next, R_next = batch_ee_pose(robot, q_new)                         # (K,3),(K,3,3)
 
-    # ------------------------------------------------------------------
-    # 4. Batched FK  →  next EE pose
-    # ------------------------------------------------------------------
-    pos_next, R_next = batch_ee_pose(robot, q_new)              # (K,3), (K,3,3)
-
-    # ------------------------------------------------------------------
-    # 5. Batched reward
-    # ------------------------------------------------------------------
+    # ── 5. Batched reward ─────────────────────────────────────────────────
     r_batch, _ = reward_math.reward_batch(
         pos_curr_batch     = env.pos_curr,
         R_curr_SO3_batch   = env.R_curr,
-        delta_q_new_batch  = delta_q_new,
+        delta_q_new_batch  = delta_q,
         delta_q_prev_batch = env.delta_q_prev,
         pos_goal_batch     = env.pos_goal,
         R_goal_SO3_batch   = env.R_goal,
         use_focal          = True,
-    )                                                            # (K,) float64
+    )                                                                       # (K,)
 
-    # ------------------------------------------------------------------
-    # 6. Collision check (sequential, optional)
-    # ------------------------------------------------------------------
-    crashed_k = [False] * K
+    # ── 6. Optional collision check (sequential) ──────────────────────────
+    crashed_k = torch.zeros(K, dtype=torch.bool, device=device)
     if check_collisions:
         for k in range(K):
             robot.q_vect = q_new[k]
@@ -361,82 +334,59 @@ def vectorised_step(
                 crashed_k[k] = True
                 r_batch[k]  -= hp.crash_w
 
-    # ------------------------------------------------------------------
-    # 7. Done flags  (success / crash / timeout)
-    # ------------------------------------------------------------------
-    # Recompute per-env errors to classify grade
-    eps_norm  = (env.pos_goal - pos_next) / reward_math.rob.max_reach   # (K,3)
-    e_pos_raw = torch.linalg.vector_norm(eps_norm, dim=1)               # (K,)
-    ori_diff  = env.R_goal - R_next
-    e_ori_raw = torch.linalg.matrix_norm(ori_diff)                      # (K,)
-
-    good_pos  = reward_math._good_pos_thresh
-    good_ori  = reward_math._good_ori_thresh
-    success_k = ((reward_math.pos_w * e_pos_raw <= good_pos) &
-                 (reward_math.rot_w * e_ori_raw <= good_ori))           # (K,) bool
-
+    # ── 7. Done flags ─────────────────────────────────────────────────────
+    eps_norm  = (env.pos_goal - pos_next) / reward_math.rob.max_reach
+    e_pos_raw = torch.linalg.vector_norm(eps_norm, dim=1)
+    e_ori_raw = torch.linalg.matrix_norm(env.R_goal - R_next)
+    success_k = ((reward_math.pos_w * e_pos_raw <= reward_math._good_pos_thresh) &
+                 (reward_math.rot_w * e_ori_raw <= reward_math._good_ori_thresh))
     env.steps += 1
     timeout_k = (env.steps >= hp.max_steps)
-    done_k    = success_k | timeout_k | torch.tensor(
-                    crashed_k, dtype=torch.bool, device=device)
-
+    done_k    = success_k | timeout_k | crashed_k
     env.ep_reward += r_batch
 
-    # ------------------------------------------------------------------
-    # 8. Cache steps and commit finished episodes
-    # ------------------------------------------------------------------
+    # ── 8. Cache steps; commit and reset finished environments ────────────
     for k in range(K):
         done = done_k[k].item()
-
         env.caches[k].append({
             "q_new":        q_new[k].cpu(),
-            "delta_q_new":  delta_q_new[k].cpu(),
+            "delta_q_new":  delta_q[k].cpu(),
             "delta_q_prev": env.delta_q_prev[k].cpu(),
             "pos_curr":     env.pos_curr[k].cpu(),
             "R_curr":       env.R_curr[k].cpu(),
             "pos_next":     pos_next[k].cpu(),
             "R_next":       R_next[k].cpu(),
             "a_norm":       a_norm_f64[k].cpu(),
-            "done":         bool(done),
+            "done":         float(done),
         })
 
         if done:
-            # Commit episode to buffer
             buffer._episode_cache = env.caches[k]
             buffer.finish_episode(
                 pos_goal   = env.pos_goal[k].cpu(),
                 R_goal_SO3 = env.R_goal[k].cpu(),
             )
-
-            # Log episode
-            grade = "GOOD" if success_k[k] else ("CRASH" if crashed_k[k] else "FAIL")
+            grade = ("GOOD" if success_k[k] else
+                     "CRASH" if crashed_k[k] else "FAIL")
             episode_log.append({
                 "total_reward": env.ep_reward[k].item(),
                 "steps":        env.steps[k].item(),
-                "success":      success_k[k].item(),
+                "success":      bool(success_k[k].item()),
                 "grade":        grade,
-                "crashed":      crashed_k[k],
+                "crashed":      bool(crashed_k[k].item()),
             })
-
-            # Reset this environment
-            env.caches[k]     = []
-            env.ep_reward[k]  = 0.0
-            env.steps[k]      = 0
-            env.ep_success[k] = False
-            env.ep_grade[k]   = "FAIL"
-            env.ep_crashed[k] = False
-
-            # Sample new start and goal
+            # Reset env k
+            env.caches[k]      = []
+            env.ep_reward[k]   = 0.0
+            env.steps[k]       = 0
             if check_collisions:
                 q_s = sample_random_q_collision_free(robot, 1)[0]
                 q_g = sample_random_q_collision_free(robot, 1)[0]
             else:
                 q_s = sample_random_q(robot, 1)[0]
                 q_g = sample_random_q(robot, 1)[0]
-
             p_s, R_s = batch_ee_pose(robot, q_s.unsqueeze(0))
             p_g, R_g = batch_ee_pose(robot, q_g.unsqueeze(0))
-
             env.q_curr[k]       = q_s
             env.pos_curr[k]     = p_s[0]
             env.R_curr[k]       = R_s[0]
@@ -444,36 +394,25 @@ def vectorised_step(
             env.R_goal[k]       = R_g[0]
             env.delta_q_prev[k] = torch.zeros(n, dtype=torch.float64, device=device)
 
-    # ------------------------------------------------------------------
-    # 9. Advance state for non-done environments
-    # ------------------------------------------------------------------
-    alive = ~done_k                                             # (K,) bool
+    # ── 9. Advance non-done environments ──────────────────────────────────
+    alive = ~done_k
     if alive.any():
         env.q_curr[alive]       = q_new[alive]
         env.pos_curr[alive]     = pos_next[alive]
         env.R_curr[alive]       = R_next[alive]
-        env.delta_q_prev[alive] = delta_q_new[alive]
+        env.delta_q_prev[alive] = delta_q[alive]
 
     total_steps += K
 
-    # ------------------------------------------------------------------
-    # 10. TD3 updates (amortised per step)
-    # ------------------------------------------------------------------
-    # We want updates_per_episode updates per "episode equivalent".
-    # An episode equivalent = max_steps steps.
-    # Per step we do updates_per_episode / max_steps updates on average.
-    # We accumulate a fractional counter and do integer updates.
-    updates_this_step = int(hp.updates_per_episode * K / hp.max_steps)
-    if updates_this_step < 1 and (total_steps % max(1, hp.max_steps // hp.updates_per_episode)) == 0:
-        updates_this_step = 1
-
+    # ── 10. TD3 updates (amortised) ───────────────────────────────────────
+    updates_this_step = max(1, int(hp.updates_per_episode * K / hp.max_steps))
     if total_steps >= hp.start_steps and len(buffer) >= hp.batch_size:
         for _ in range(updates_this_step):
             batch = buffer.sample(hp.batch_size)
             if batch is None:
                 break
             td3.train_step(
-                batch        = batch,    # already float32 on device from buffer
+                batch        = batch,
                 gamma        = hp.gamma,
                 tau          = hp.tau,
                 policy_delay = hp.policy_delay,
@@ -496,9 +435,7 @@ def train(hp:               HParams,
           check_collisions: bool = False,
           trial:            Optional[optuna.Trial] = None,
           verbose:          bool = True) -> float:
-    """
-    Full training run.  Returns success rate over the last 10% of episodes.
-    """
+
     K         = hp.n_envs
     n_joints  = len(robot.a)
     state_dim = 3 + 6 + n_joints
@@ -512,7 +449,6 @@ def train(hp:               HParams,
         vel_lambda = [hp.vel_lambda] * n_joints,
         acc_lambda = [hp.acc_lambda] * n_joints,
     )
-
     buffer = Replay_Buffer(
         buffer_size     = hp.buffer_size,
         reward_math     = reward_math,
@@ -523,7 +459,6 @@ def train(hp:               HParams,
         her_ratio_end   = hp.her_ratio_end,
         her_decay_steps = hp.her_decay_steps,
     )
-
     td3 = TD3(
         state_dim    = state_dim,
         action_dim   = n_joints,
@@ -534,56 +469,44 @@ def train(hp:               HParams,
         dtype        = torch.float32,
     )
 
-    # Initialise vectorised environment state
     env = VecEnvState(K=K, n=n_joints, device=robot.device)
-
     if check_collisions:
-        q_starts = sample_random_q_collision_free(robot, K)
-        q_goals  = sample_random_q_collision_free(robot, K)
+        q_s = sample_random_q_collision_free(robot, K)
+        q_g = sample_random_q_collision_free(robot, K)
     else:
-        q_starts = sample_random_q(robot, K)
-        q_goals  = sample_random_q(robot, K)
+        q_s = sample_random_q(robot, K)
+        q_g = sample_random_q(robot, K)
 
-    env.q_curr   = q_starts
-    p_s, R_s     = batch_ee_pose(robot, q_starts)
-    p_g, R_g     = batch_ee_pose(robot, q_goals)
-    env.pos_curr = p_s
-    env.R_curr   = R_s
-    env.pos_goal = p_g
-    env.R_goal   = R_g
+    env.q_curr   = q_s
+    p_s, R_s     = batch_ee_pose(robot, q_s)
+    p_g, R_g     = batch_ee_pose(robot, q_g)
+    env.pos_curr = p_s;  env.R_curr = R_s
+    env.pos_goal = p_g;  env.R_goal = R_g
 
-    episode_log  = []
-    total_steps  = 0
-    update_step  = 0
-    eval_start_n = int(hp.n_episodes * 0.90)
-    t0           = time.time()
-
-    # Total steps to run ≈ n_episodes × max_steps (each env contributes)
+    episode_log      = []
+    total_steps      = 0
+    update_step      = 0
+    eval_start_n     = int(hp.n_episodes * 0.90)
     total_step_budget = hp.n_episodes * hp.max_steps
-
-    log_interval = max(1, hp.n_episodes // 100)   # log ~100 times per run
+    log_interval     = max(1, hp.n_episodes // 100)
+    t0               = time.time()
 
     while len(episode_log) < hp.n_episodes:
-
-        # Current exploration sigma
         if hp.decay_expl_noise and total_steps >= hp.start_steps:
             frac = min(total_steps / max(total_step_budget, 1), 1.0)
-            current_sigma = hp.expl_sigma + frac * (hp.expl_sigma_end - hp.expl_sigma)
+            sigma = hp.expl_sigma + frac * (hp.expl_sigma_end - hp.expl_sigma)
         else:
-            current_sigma = hp.expl_sigma
+            sigma = hp.expl_sigma
 
         total_steps, update_step = vectorised_step(
             env=env, robot=robot, reward_math=reward_math,
             td3=td3, buffer=buffer, hp=hp,
             total_steps=total_steps, update_step=update_step,
             check_collisions=check_collisions,
-            current_sigma=current_sigma,
-            episode_log=episode_log,
+            current_sigma=sigma, episode_log=episode_log,
         )
 
         n_ep = len(episode_log)
-
-        # Logging
         if verbose and n_ep > 0 and n_ep % log_interval == 0:
             window    = episode_log[max(0, n_ep - log_interval):]
             sr        = sum(e["success"] for e in window) / len(window) * 100
@@ -595,14 +518,12 @@ def train(hp:               HParams,
             print(f"  ep {n_ep:6d}/{hp.n_episodes} | "
                   f"SR {sr:5.1f}% | CR {cr:4.1f}% | "
                   f"AvgR {avg_r:7.2f} | Steps {avg_steps:5.1f} | "
-                  f"sigma {current_sigma:.3f} | "
-                  f"HER {buffer.her_ratio:.2f} | Buf {len(buffer):7d} | "
-                  f"{elapsed:.0f}s{warmup}")
+                  f"sigma {sigma:.3f} | HER {buffer.her_ratio:.2f} | "
+                  f"Buf {len(buffer):7d} | {elapsed:.0f}s{warmup}")
 
-        # Optuna pruning
         if trial is not None and n_ep >= eval_start_n and n_ep % log_interval == 0:
-            n_eval   = n_ep - eval_start_n
-            curr_sr  = sum(e["success"] for e in episode_log[eval_start_n:]) / max(n_eval, 1)
+            n_eval  = n_ep - eval_start_n
+            curr_sr = sum(e["success"] for e in episode_log[eval_start_n:]) / max(n_eval, 1)
             trial.report(curr_sr, step=n_ep)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -643,13 +564,15 @@ def suggest_hparams(trial: optuna.Trial,
     return hp
 
 
-def run_tuning(base_hp:       HParams,
-               tune_flags:    TuneConfig,
-               n_trials:      int = 50,
-               parallel_mode: str = "gpu",
-               n_jobs:        int = 1,
+def run_tuning(base_hp:          HParams,
+               tune_flags:       TuneConfig,
+               n_trials:         int  = 50,
+               parallel_mode:    str  = "gpu",
+               n_jobs:           int  = 1,
                check_collisions: bool = False,
-               storage_path:  str = "optuna_study.db"):
+               storage_path:     str  = "optuna_study.db",
+               params_out:       str  = "best_params.json"):
+
     storage_url = f"sqlite:///{storage_path}"
     pruner = optuna.pruners.MedianPruner(
         n_startup_trials = 5,
@@ -660,12 +583,10 @@ def run_tuning(base_hp:       HParams,
         study_name="td3_ik_tuning", direction="maximize",
         storage=storage_url, load_if_exists=True, pruner=pruner,
     )
-    if parallel_mode == "gpu":
-        device, eff_jobs = torch.device("cuda" if torch.cuda.is_available() else "cpu"), 1
-        print(f"[Optuna] Sequential GPU trials  device={device}")
-    else:
-        device, eff_jobs = torch.device("cpu"), n_jobs
-        print(f"[Optuna] Parallel CPU trials  n_jobs={eff_jobs}")
+    device   = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                if parallel_mode == "gpu" else torch.device("cpu"))
+    eff_jobs = 1 if parallel_mode == "gpu" else n_jobs
+    print(f"[Optuna] mode={parallel_mode}  device={device}  n_jobs={eff_jobs}")
 
     def objective(trial):
         hp    = suggest_hparams(trial, base_hp, tune_flags)
@@ -677,14 +598,23 @@ def run_tuning(base_hp:       HParams,
                      check_collisions=check_collisions, trial=trial, verbose=True)
 
     study.optimize(objective, n_trials=n_trials, n_jobs=eff_jobs)
+
     print("\n" + "=" * 60)
     best = study.best_trial
     print(f"Best SR: {best.value*100:.2f}%")
     for k, v in best.params.items():
         print(f"  {k:20s} = {v}")
+
+    # Reconstruct best HParams and save to JSON
+    best_hp = suggest_hparams(best, base_hp, tune_flags)
+    save_params(best_hp, params_out)
     print(f"\nDashboard: optuna-dashboard {storage_url}")
     return study
 
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
 def launch_dashboard(storage_path: str = "optuna_study.db", port: int = 8080):
     storage_url = f"sqlite:///{storage_path}"
@@ -698,14 +628,18 @@ def launch_dashboard(storage_path: str = "optuna_study.db", port: int = 8080):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="TD3 IK — vectorised training",
+        description="TD3 IK Agent",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=__doc__,
     )
     p.add_argument("--mode", choices=["train", "tune", "dashboard"], default="train")
-    p.add_argument("--parallel_mode", choices=["gpu", "cpu"], default="gpu")
-    p.add_argument("--n_jobs",             type=int,  default=4)
-    p.add_argument("--check_collisions",   action="store_true",
-                   help="Enable sequential self-collision checking (slower)")
+    p.add_argument("--load_params",      type=str, default=None,
+                   help="JSON file of saved hyperparameters (from tuning)")
+    p.add_argument("--params_out",       type=str, default="best_params.json",
+                   help="Where to save best params after tuning")
+    p.add_argument("--parallel_mode",    choices=["gpu", "cpu"], default="gpu")
+    p.add_argument("--n_jobs",           type=int, default=4)
+    p.add_argument("--check_collisions", action="store_true")
     p.add_argument("--n_episodes",          type=int,   default=10_000)
     p.add_argument("--max_steps",           type=int,   default=200)
     p.add_argument("--updates_per_episode", type=int,   default=50)
@@ -722,13 +656,15 @@ def parse_args():
                 "acc_lambda", "her_ratio_start", "her_decay_steps",
                 "expl_sigma", "expl_sigma_end", "target_sigma"]
     for name in tuneable:
-        p.add_argument(f"--no_tune_{name}", action="store_true")
+        p.add_argument(f"--no_tune_{name}", action="store_true",
+                       help=f"Fix {name} at its HParams default")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    # Build base HParams from CLI args
     hp = HParams(
         n_episodes          = args.n_episodes,
         max_steps           = args.max_steps,
@@ -738,6 +674,12 @@ def main():
         start_steps         = args.start_steps,
         decay_expl_noise    = args.decay_expl_noise,
     )
+
+    # Override with saved params if --load_params provided
+    if args.load_params:
+        hp = load_params(args.load_params, hp)
+
+    # Build TuneConfig
     tc = TuneConfig()
     tuneable = ["gamma", "tau", "actor_lr", "critic_lr", "hidden_width",
                 "hidden_depth", "n_envs", "pos_w", "rot_w", "vel_lambda",
@@ -749,17 +691,26 @@ def main():
 
     if args.mode == "dashboard":
         launch_dashboard(args.storage_path, args.dashboard_port)
+
     elif args.mode == "train":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[Train] device={device}  n_envs={hp.n_envs}  check_collisions={args.check_collisions}")
+        print(f"[Train] device={device}  n_envs={hp.n_envs}  "
+              f"check_collisions={args.check_collisions}")
         robot = make_robot(device)
         train(hp=hp, robot=robot, device=device,
               check_collisions=args.check_collisions, verbose=True)
+
     elif args.mode == "tune":
-        run_tuning(base_hp=hp, tune_flags=tc, n_trials=args.n_trials,
-                   parallel_mode=args.parallel_mode, n_jobs=args.n_jobs,
-                   check_collisions=args.check_collisions,
-                   storage_path=args.storage_path)
+        run_tuning(
+            base_hp          = hp,
+            tune_flags       = tc,
+            n_trials         = args.n_trials,
+            parallel_mode    = args.parallel_mode,
+            n_jobs           = args.n_jobs,
+            check_collisions = args.check_collisions,
+            storage_path     = args.storage_path,
+            params_out       = args.params_out,
+        )
 
 
 if __name__ == "__main__":
