@@ -262,6 +262,50 @@ class Reward_Math:
 
         return torch.cat([norm_dist, rot_6d, prev_vel_norm])  # (3+6+n,)
 
+    def build_state_batch(self,
+                          pos_curr_batch:     torch.Tensor,
+                          pos_goal:           torch.Tensor,
+                          R_goal_SO3:         torch.Tensor,
+                          delta_q_prev_batch: torch.Tensor,
+                          ) -> torch.Tensor:
+        """
+        Vectorised state builder for an entire episode (T steps) in one tensor op.
+
+            s = [ norm_dist_to_goal (3,) | R_goal_6D (6,) | prev_vel_norm (n,) ]
+
+        Parameters
+        ----------
+        pos_curr_batch     : (T, 3)           EE position at each step
+        pos_goal           : (3,) or (T, 3)   goal position (broadcast if scalar)
+        R_goal_SO3         : (3,3) or (T,3,3) goal rotation (broadcast if scalar)
+        delta_q_prev_batch : (T, n)           previous joint deltas at each step
+
+        Returns
+        -------
+        states : (T, 3 + 6 + n) float64 on self.device
+        """
+        T = pos_curr_batch.shape[0]
+        pos_curr_batch     = pos_curr_batch.to(dtype=torch.float64, device=self.device)
+        delta_q_prev_batch = delta_q_prev_batch.to(dtype=torch.float64, device=self.device)
+
+        if pos_goal.dim() == 1:
+            pos_goal = pos_goal.unsqueeze(0).expand(T, -1).clone()
+        if R_goal_SO3.dim() == 2:
+            R_goal_SO3 = R_goal_SO3.unsqueeze(0).expand(T, -1, -1).clone()
+        pos_goal   = pos_goal.to(dtype=torch.float64, device=self.device)
+        R_goal_SO3 = R_goal_SO3.to(dtype=torch.float64, device=self.device)
+
+        norm_dist = (pos_goal - pos_curr_batch) / self.rob.max_reach        # (T, 3)
+        rot_6d    = torch.cat([R_goal_SO3[:, :, 0],
+                               R_goal_SO3[:, :, 1]], dim=1)                 # (T, 6)
+        low  = self.q_l - self.q_h
+        high = self.q_h - self.q_l
+        prev_vel_norm = (2.0 * ((delta_q_prev_batch - low)
+                                / (high - low).clamp(min=1e-8)) - 1.0)     # (T, n)
+
+        return torch.cat([norm_dist, rot_6d, prev_vel_norm], dim=1)         # (T, S)
+
+
     # ─────────────────────────────────────────────────────────────────────────
     # Individual reward terms
     # ─────────────────────────────────────────────────────────────────────────
