@@ -514,12 +514,18 @@ def train(hp:               HParams,
             avg_r     = sum(e["total_reward"] for e in window) / len(window)
             avg_steps = sum(e["steps"] for e in window) / len(window)
             elapsed   = time.time() - t0
-            warmup    = " [warmup]" if total_steps < hp.start_steps else ""
-            print(f"  ep {n_ep:6d}/{hp.n_episodes} | "
+            warmup    = " [W]" if total_steps < hp.start_steps else ""
+            # \r overwrites the current line — 100 updates stay as one line.
+            # end="" suppresses newline; flush=True forces immediate display.
+            # A newline is printed only at the final episode so the last
+            # result is preserved in the terminal after training ends.
+            final = (n_ep >= hp.n_episodes)
+            print(f"\r  ep {n_ep:6d}/{hp.n_episodes} | "
                   f"SR {sr:5.1f}% | CR {cr:4.1f}% | "
                   f"AvgR {avg_r:7.2f} | Steps {avg_steps:5.1f} | "
                   f"sigma {sigma:.3f} | HER {buffer.her_ratio:.2f} | "
-                  f"Buf {len(buffer):7d} | {elapsed:.0f}s{warmup}")
+                  f"Buf {len(buffer):7d} | {elapsed:.0f}s{warmup}",
+                  end="\n" if final else "", flush=True)
 
         if trial is not None and n_ep >= eval_start_n and n_ep % log_interval == 0:
             n_eval  = n_ep - eval_start_n
