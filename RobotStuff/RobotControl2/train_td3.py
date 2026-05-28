@@ -528,17 +528,19 @@ def train(hp:               HParams,
                   end="\n" if final else "", flush=True)
 
         if trial is not None and n_ep >= eval_start_n and n_ep % log_interval == 0:
-            n_eval  = n_ep - eval_start_n
-            curr_sr = sum(e["success"] for e in episode_log[eval_start_n:]) / max(n_eval, 1)
-            trial.report(curr_sr, step=n_ep)
+            eval_window  = episode_log[eval_start_n:]
+            curr_avg_r   = sum(e["total_reward"] for e in eval_window) / max(len(eval_window), 1)
+            trial.report(curr_avg_r, step=n_ep)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-    eval_log = episode_log[eval_start_n:]
-    final_sr = sum(e["success"] for e in eval_log) / max(len(eval_log), 1)
+    eval_log     = episode_log[eval_start_n:]
+    final_avg_r  = sum(e["total_reward"] for e in eval_log) / max(len(eval_log), 1)
+    final_sr     = sum(e["success"]      for e in eval_log) / max(len(eval_log), 1)
     if verbose:
-        print(f"\n  Final success rate (last 10%): {final_sr * 100:.2f}%")
-    return final_sr
+        print(f"\n  Avg reward (last 10%): {final_avg_r:.3f} | "
+              f"Success rate: {final_sr * 100:.2f}%")
+    return final_avg_r   # Optuna objective: maximise mean reward over last 10%
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +609,7 @@ def run_tuning(base_hp:          HParams,
 
     print("\n" + "=" * 60)
     best = study.best_trial
-    print(f"Best SR: {best.value*100:.2f}%")
+    print(f"Best avg reward (last 10%): {best.value:.3f}")
     for k, v in best.params.items():
         print(f"  {k:20s} = {v}")
 
