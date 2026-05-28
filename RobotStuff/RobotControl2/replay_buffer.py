@@ -146,18 +146,22 @@ class Replay_Buffer:
         rm    = self.rm
         ratio = self.her_ratio
 
-        # ── Stack episode cache into (T, *) tensors on CPU ─────────────────
-        pos_curr_T     = torch.stack([c["pos_curr"]     for c in cache])  # (T, 3)
-        pos_next_T     = torch.stack([c["pos_next"]     for c in cache])  # (T, 3)
-        R_curr_T       = torch.stack([c["R_curr"]       for c in cache])  # (T, 3, 3)
-        R_next_T       = torch.stack([c["R_next"]       for c in cache])  # (T, 3, 3)
-        delta_q_new_T  = torch.stack([c["delta_q_new"]  for c in cache])  # (T, n)
-        delta_q_prev_T = torch.stack([c["delta_q_prev"] for c in cache])  # (T, n)
-        a_norm_T       = torch.stack([c["a_norm"]       for c in cache])  # (T, n)
+        # ── Stack episode cache and move to rm.device ────────────────────
+        # Cache entries are CPU float64. All reward_batch / build_state_batch
+        # calls operate on rm.device (CUDA when training on GPU), so we cast
+        # once here to avoid cross-device errors inside those calls.
+        dev = rm.device
+        pos_curr_T     = torch.stack([c["pos_curr"]     for c in cache]).to(dev)  # (T, 3)
+        pos_next_T     = torch.stack([c["pos_next"]     for c in cache]).to(dev)  # (T, 3)
+        R_curr_T       = torch.stack([c["R_curr"]       for c in cache]).to(dev)  # (T, 3, 3)
+        R_next_T       = torch.stack([c["R_next"]       for c in cache]).to(dev)  # (T, 3, 3)
+        delta_q_new_T  = torch.stack([c["delta_q_new"]  for c in cache]).to(dev)  # (T, n)
+        delta_q_prev_T = torch.stack([c["delta_q_prev"] for c in cache]).to(dev)  # (T, n)
+        a_norm_T       = torch.stack([c["a_norm"]       for c in cache]).to(dev)  # (T, n)
         done_T         = torch.tensor([c["done"] for c in cache],
-                                      dtype=torch.float32)                 # (T,)
-        pos_goal   = _cpu64(pos_goal)
-        R_goal_SO3 = _cpu64(R_goal_SO3)
+                                      dtype=torch.float32, device=dev)            # (T,)
+        pos_goal   = _cpu64(pos_goal).to(dev)
+        R_goal_SO3 = _cpu64(R_goal_SO3).to(dev)
 
         # ── Real transitions ────────────────────────────────────────────────
         # State at t: uses pos_curr[t] and delta_q_prev[t]
@@ -194,11 +198,11 @@ class Replay_Buffer:
             # For each step t, decide whether to generate a HER transition
             # Sample future goal indices: for step t, goal comes from [t+1, T-1]
             # Steps that have no future (t == T-1) are excluded.
-            eligible = torch.arange(T - 1)                  # steps 0..T-2
+            eligible = torch.arange(T - 1, device=dev)       # steps 0..T-2
             n_eligible = len(eligible)
 
             # Bernoulli mask over eligible steps
-            mask = torch.rand(n_eligible) < ratio            # (T-1,) bool
+            mask = torch.rand(n_eligible, device=dev) < ratio  # (T-1,) bool
 
             if mask.any():
                 t_idx = eligible[mask]                       # which steps get HER
@@ -206,7 +210,7 @@ class Replay_Buffer:
                 # For each selected step, sample a random future index
                 # future in [t+1, T-1] — use uniform random offset
                 range_sizes  = T - 1 - t_idx                # (M,)
-                rand_offsets = (torch.rand(len(t_idx)) * range_sizes).long()
+                rand_offsets = (torch.rand(len(t_idx), device=dev) * range_sizes).long()
                 future_idx   = t_idx + 1 + rand_offsets     # (M,)
 
                 # HER goal = achieved pose at the future step
