@@ -269,10 +269,12 @@ class TD3:
 
         self.critic_1_optim.zero_grad()
         loss_1.backward()
+        nn.utils.clip_grad_norm_(self.critic_1.parameters(), max_norm=1.0)
         self.critic_1_optim.step()
 
         self.critic_2_optim.zero_grad()
         loss_2.backward()
+        nn.utils.clip_grad_norm_(self.critic_2.parameters(), max_norm=1.0)
         self.critic_2_optim.step()
 
         return loss_1.item(), loss_2.item()
@@ -305,6 +307,7 @@ class TD3:
 
         self.actor_optim.zero_grad()
         actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
         self.actor_optim.step()
 
         # Re-enable critic gradients

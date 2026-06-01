@@ -87,6 +87,7 @@ import optuna_dashboard
 
 from forward_kinematics import Robot_math
 from rewards_math       import Reward_Math
+from rot_math           import to_6D_R_batch
 from replay_buffer      import Replay_Buffer
 from td3                import TD3
 
@@ -277,14 +278,14 @@ def vectorised_step(env:              VecEnvState,
     n      = env.n
     device = robot.device
 
-    # ── 1. Build batched state (K, S) — pure tensor ops ───────────────────
-    norm_dist = (env.pos_goal - env.pos_curr) / reward_math.rob.max_reach  # (K,3)
-    rot_6d    = torch.cat([env.R_goal[:, :, 0],
-                            env.R_goal[:, :, 1]], dim=1)                    # (K,6)
-    vel_low   = robot.low_bounds  - robot.high_bounds                       # (n,)
-    vel_high  = robot.high_bounds - robot.low_bounds                        # (n,)
-    denom     = (vel_high - vel_low).clamp(min=1e-8)
-    prev_vel  = 2.0 * ((env.delta_q_prev - vel_low) / denom) - 1.0        # (K,n)
+    # ── 1. Build batched state (K, S) using reward_math / rot_math methods ──
+    # norm_dist: (K, 3) — normalised displacement vector to goal
+    norm_dist = reward_math.get_normal_dist_to_goal(env.pos_curr,
+                                                     env.pos_goal)          # (K,3)
+    # rot_6d: (K, 6) — first two columns of each goal rotation matrix
+    rot_6d    = to_6D_R_batch(env.R_goal)                                   # (K,6)
+    # prev_vel: (K, n) — previous action in normalised velocity space
+    prev_vel  = reward_math.get_normal_joint_vel(env.delta_q_prev)         # (K,n)
     state_f64 = torch.cat([norm_dist, rot_6d, prev_vel], dim=1)            # (K,S)
     state_f32 = state_f64.to(dtype=torch.float32, device=td3.device)
 
@@ -300,11 +301,14 @@ def vectorised_step(env:              VecEnvState,
 
     a_norm_f64 = a_norm_f32.to(dtype=torch.float64, device=device)
 
-    # ── 3. Apply actions ──────────────────────────────────────────────────
-    q_range    = robot.high_bounds - robot.low_bounds
-    q_norm     = 2.0 * ((env.q_curr - robot.low_bounds) / q_range.clamp(min=1e-8)) - 1.0
-    q_new_norm = (q_norm + a_norm_f64).clamp(-1.0, 1.0)
-    q_new      = robot.low_bounds + (q_new_norm + 1.0) * q_range / 2.0    # (K,n)
+    # ── 3. Apply actions using reward_math normalisation methods ────────────
+    # Normalise current q, add normalised delta, clamp to [-1,1], denormalise
+    q_norm     = reward_math.get_normal_joint_value(env.q_curr)            # (K,n)
+    q_new_norm = (q_norm + a_norm_f64).clamp(-1.0, 1.0)                   # (K,n)
+    q_new      = reward_math.get_original_joint_value(q_new_norm)         # (K,n)
+    # Denormalise action to real joint velocity units for reward/buffer
+    vel_low    = robot.low_bounds  - robot.high_bounds                     # (n,)
+    vel_high   = robot.high_bounds - robot.low_bounds                      # (n,)
     delta_q    = reward_math.denormalize_from_range(
         a_norm_f64,
         vel_low.unsqueeze(0).expand(K, -1),
@@ -335,9 +339,11 @@ def vectorised_step(env:              VecEnvState,
                 r_batch[k]  -= hp.crash_w
 
     # ── 7. Done flags ─────────────────────────────────────────────────────
-    eps_norm  = (env.pos_goal - pos_next) / reward_math.rob.max_reach
-    e_pos_raw = torch.linalg.vector_norm(eps_norm, dim=1)
-    e_ori_raw = torch.linalg.matrix_norm(env.R_goal - R_next)
+    # Use reward_math methods for consistent normalisation
+    eps_norm  = reward_math.get_normal_dist_to_goal(pos_next,
+                                                     env.pos_goal)         # (K,3)
+    e_pos_raw = torch.linalg.vector_norm(eps_norm, dim=1)                  # (K,)
+    e_ori_raw = torch.linalg.matrix_norm(env.R_goal - R_next)              # (K,)
     success_k = ((reward_math.pos_w * e_pos_raw <= reward_math._good_pos_thresh) &
                  (reward_math.rot_w * e_ori_raw <= reward_math._good_ori_thresh))
     env.steps += 1
@@ -368,12 +374,18 @@ def vectorised_step(env:              VecEnvState,
             )
             grade = ("GOOD" if success_k[k] else
                      "CRASH" if crashed_k[k] else "FAIL")
+            # Final normalised EE distance and orientation error at episode end
+            # Used as the Optuna MAE objective — independent of reward weights.
+            final_pos_err = e_pos_raw[k].item()          # normalised [0,1]
+            final_ori_err = e_ori_raw[k].item()          # Frobenius norm
             episode_log.append({
-                "total_reward": env.ep_reward[k].item(),
-                "steps":        env.steps[k].item(),
-                "success":      bool(success_k[k].item()),
-                "grade":        grade,
-                "crashed":      bool(crashed_k[k].item()),
+                "total_reward":  env.ep_reward[k].item(),
+                "steps":         env.steps[k].item(),
+                "success":       bool(success_k[k].item()),
+                "grade":         grade,
+                "crashed":       bool(crashed_k[k].item()),
+                "final_pos_err": final_pos_err,
+                "final_ori_err": final_ori_err,
             })
             # Reset env k
             env.caches[k]      = []
@@ -519,28 +531,40 @@ def train(hp:               HParams,
             # end="" suppresses newline; flush=True forces immediate display.
             # A newline is printed only at the final episode so the last
             # result is preserved in the terminal after training ends.
-            final = (n_ep >= hp.n_episodes)
+            avg_pos = sum(e["final_pos_err"] for e in window) / len(window)
+            avg_ori = sum(e["final_ori_err"] for e in window) / len(window)
+            mae     = avg_pos + 0.1 * avg_ori
+            final   = (n_ep >= hp.n_episodes)
             print(f"\r  ep {n_ep:6d}/{hp.n_episodes} | "
-                  f"SR {sr:5.1f}% | CR {cr:4.1f}% | "
-                  f"AvgR {avg_r:7.2f} | Steps {avg_steps:5.1f} | "
-                  f"sigma {sigma:.3f} | HER {buffer.her_ratio:.2f} | "
-                  f"Buf {len(buffer):7d} | {elapsed:.0f}s{warmup}",
+                  f"SR {sr:5.1f}% | MAE {mae:.4f} | AvgR {avg_r:7.2f} | "
+                  f"Steps {avg_steps:5.1f} | sigma {sigma:.3f} | "
+                  f"HER {buffer.her_ratio:.2f} | Buf {len(buffer):7d} | "
+                  f"{elapsed:.0f}s{warmup}",
                   end="\n" if final else "", flush=True)
 
         if trial is not None and n_ep >= eval_start_n and n_ep % log_interval == 0:
             eval_window  = episode_log[eval_start_n:]
-            curr_avg_r   = sum(e["total_reward"] for e in eval_window) / max(len(eval_window), 1)
-            trial.report(curr_avg_r, step=n_ep)
+            n_eval       = max(len(eval_window), 1)
+            # MAE objective: mean(pos_err + ori_scale * ori_err) over last 10%.
+            # ori_scale=0.1 balances Frobenius norm units against normalised
+            # position error units. Both are minimised — smaller is better.
+            curr_mae = (sum(e["final_pos_err"] + 0.1 * e["final_ori_err"]
+                            for e in eval_window) / n_eval)
+            trial.report(curr_mae, step=n_ep)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-    eval_log     = episode_log[eval_start_n:]
-    final_avg_r  = sum(e["total_reward"] for e in eval_log) / max(len(eval_log), 1)
-    final_sr     = sum(e["success"]      for e in eval_log) / max(len(eval_log), 1)
+    eval_log    = episode_log[eval_start_n:]
+    n_eval      = max(len(eval_log), 1)
+    final_mae   = (sum(e["final_pos_err"] + 0.1 * e["final_ori_err"]
+                       for e in eval_log) / n_eval)
+    final_avg_r = sum(e["total_reward"] for e in eval_log) / n_eval
+    final_sr    = sum(e["success"]      for e in eval_log) / n_eval
     if verbose:
-        print(f"\n  Avg reward (last 10%): {final_avg_r:.3f} | "
-              f"Success rate: {final_sr * 100:.2f}%")
-    return final_avg_r   # Optuna objective: maximise mean reward over last 10%
+        print(f"\n  MAE (last 10%): {final_mae:.4f} | "
+              f"Avg reward: {final_avg_r:.2f} | "
+              f"SR: {final_sr*100:.2f}%")
+    return final_mae   # Optuna objective: minimise MAE (pos + ori error)
 
 
 # ---------------------------------------------------------------------------
@@ -558,8 +582,8 @@ def suggest_hparams(trial: optuna.Trial,
     if flags.hidden_width:    hp.hidden_width     = trial.suggest_categorical("hidden_width", [128, 256, 512])
     if flags.hidden_depth:    hp.hidden_depth     = trial.suggest_int("hidden_depth", 1, 4)
     if flags.n_envs:          hp.n_envs           = trial.suggest_categorical("n_envs", [4, 8, 16, 32])
-    if flags.pos_w:           hp.pos_w            = trial.suggest_float("pos_w", 0.5, 3.0)
-    if flags.rot_w:           hp.rot_w            = trial.suggest_float("rot_w", 0.1, 2.0)
+    if flags.pos_w:           hp.pos_w            = trial.suggest_float("pos_w", 1.0, 100.0, log=True)
+    if flags.rot_w:           hp.rot_w            = trial.suggest_float("rot_w", 1.0, 10.0, log=True)
     if flags.vel_lambda:      hp.vel_lambda       = trial.suggest_float("vel_lambda", 0.01, 0.5, log=True)
     if flags.acc_lambda:      hp.acc_lambda       = trial.suggest_float("acc_lambda", 0.01, 0.5, log=True)
     if flags.her_ratio_start: hp.her_ratio_start  = trial.suggest_float("her_ratio_start", 0.4, 0.95)
@@ -588,7 +612,7 @@ def run_tuning(base_hp:          HParams,
         interval_steps   = max(1, base_hp.n_episodes // 100),
     )
     study = optuna.create_study(
-        study_name="td3_ik_tuning", direction="maximize",
+        study_name="td3_ik_tuning", direction="minimize",
         storage=storage_url, load_if_exists=True, pruner=pruner,
     )
     device   = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -609,7 +633,7 @@ def run_tuning(base_hp:          HParams,
 
     print("\n" + "=" * 60)
     best = study.best_trial
-    print(f"Best avg reward (last 10%): {best.value:.3f}")
+    print(f"Best MAE (last 10%): {best.value:.4f}")
     for k, v in best.params.items():
         print(f"  {k:20s} = {v}")
 
