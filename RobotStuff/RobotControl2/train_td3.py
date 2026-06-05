@@ -134,7 +134,12 @@ class HParams:
     updates_per_episode: int   = 50
     batch_size:          int   = 2048
     n_envs:              int   = 8
-    start_steps:         int   = 2_000
+    # Number of transitions to collect with uniform random actions before
+    # any TD3 training begins.  HER ratio is held at her_ratio_start during
+    # this phase and begins decaying only once training starts.
+    # Rule of thumb: fill roughly half the buffer for good initial coverage.
+    # At K=8 envs, ~180 steps/ep, 1.8x HER: ~500k transitions ≈ 350 episodes.
+    warmup_transitions:  int   = 500_000
 
     # TD3
     gamma:               float = 0.99
@@ -142,7 +147,7 @@ class HParams:
     actor_lr:            float = 1e-4
     critic_lr:           float = 1e-3
     policy_delay:        int   = 2
-    hidden_width:        int   = 256
+    hidden_width:        int   = 400
     hidden_depth:        int   = 2
 
     # Exploration noise
@@ -269,9 +274,17 @@ def vectorised_step(env:              VecEnvState,
                     update_step:      int,
                     check_collisions: bool,
                     current_sigma:    float,
-                    episode_log:      list) -> tuple[int, int]:
+                    episode_log:      list,
+                    uniform_random:   bool = False,
+                    do_updates:       bool = True) -> tuple[int, int]:
     """
     Advance all K environments by one timestep.
+
+    uniform_random : if True, bypass actor and sample actions uniformly.
+                     Used during the dedicated warmup phase.
+    do_updates     : if False, skip TD3 gradient updates this step.
+                     Set False during warmup so the buffer fills first.
+
     Returns updated (total_steps, update_step).
     """
     K      = env.K
@@ -290,7 +303,7 @@ def vectorised_step(env:              VecEnvState,
     state_f32 = state_f64.to(dtype=torch.float32, device=td3.device)
 
     # ── 2. Select actions ─────────────────────────────────────────────────
-    if total_steps < hp.start_steps:
+    if uniform_random:
         a_norm_f32 = torch.rand(K, n, dtype=torch.float32, device=td3.device) * 2 - 1
     else:
         with torch.no_grad():
@@ -418,7 +431,7 @@ def vectorised_step(env:              VecEnvState,
 
     # ── 10. TD3 updates (amortised) ───────────────────────────────────────
     updates_this_step = max(1, int(hp.updates_per_episode * K / hp.max_steps))
-    if total_steps >= hp.start_steps and len(buffer) >= hp.batch_size:
+    if do_updates and len(buffer) >= hp.batch_size:
         for _ in range(updates_this_step):
             batch = buffer.sample(hp.batch_size)
             if batch is None:
@@ -495,17 +508,47 @@ def train(hp:               HParams,
     env.pos_curr = p_s;  env.R_curr = R_s
     env.pos_goal = p_g;  env.R_goal = R_g
 
-    episode_log      = []
-    total_steps      = 0
-    update_step      = 0
-    eval_start_n     = int(hp.n_episodes * 0.90)
+    episode_log       = []
+    total_steps       = 0
+    update_step       = 0
+    eval_start_n      = int(hp.n_episodes * 0.90)
     total_step_budget = hp.n_episodes * hp.max_steps
-    log_interval     = max(1, hp.n_episodes // 100)
-    t0               = time.time()
+    log_interval      = max(1, hp.n_episodes // 100)
+    t0                = time.time()
 
+    # ── Dedicated warmup phase ────────────────────────────────────────────
+    # Run uniform random actions across all K environments until the replay
+    # buffer holds warmup_transitions entries.  No TD3 updates happen here.
+    # HER ratio is frozen at her_ratio_start for the entire warmup so the
+    # episode counter (which drives HER decay) doesn't start until training.
+    warmup_log = []   # warmup episodes tracked separately, not in episode_log
+    if hp.warmup_transitions > 0:
+        print(f"[Warmup] Filling buffer to {hp.warmup_transitions:,} transitions "
+              f"with uniform random actions across {K} envs...", flush=True)
+        warmup_steps = 0
+        while len(buffer) < hp.warmup_transitions:
+            total_steps, update_step = vectorised_step(
+                env=env, robot=robot, reward_math=reward_math,
+                td3=td3, buffer=buffer, hp=hp,
+                total_steps=total_steps, update_step=update_step,
+                check_collisions=check_collisions,
+                current_sigma=hp.expl_sigma,
+                episode_log=warmup_log,
+                uniform_random=True,
+                do_updates=False,      # no gradient updates during warmup
+            )
+            warmup_steps += K
+            # Overwrite-in-place progress line
+            print(f"\r[Warmup] {len(buffer):>9,} / {hp.warmup_transitions:,} transitions | "
+                  f"{len(warmup_log)} episodes | {warmup_steps} env-steps",
+                  end="", flush=True)
+        print(f"\n[Warmup] Complete — {len(buffer):,} transitions, "
+              f"{len(warmup_log)} episodes.", flush=True)
+
+    # ── Main training loop ────────────────────────────────────────────────
     while len(episode_log) < hp.n_episodes:
-        if hp.decay_expl_noise and total_steps >= hp.start_steps:
-            frac = min(total_steps / max(total_step_budget, 1), 1.0)
+        if hp.decay_expl_noise:
+            frac  = min(total_steps / max(total_step_budget, 1), 1.0)
             sigma = hp.expl_sigma + frac * (hp.expl_sigma_end - hp.expl_sigma)
         else:
             sigma = hp.expl_sigma
@@ -516,6 +559,8 @@ def train(hp:               HParams,
             total_steps=total_steps, update_step=update_step,
             check_collisions=check_collisions,
             current_sigma=sigma, episode_log=episode_log,
+            uniform_random=False,
+            do_updates=True,
         )
 
         n_ep = len(episode_log)
@@ -526,7 +571,7 @@ def train(hp:               HParams,
             avg_r     = sum(e["total_reward"] for e in window) / len(window)
             avg_steps = sum(e["steps"] for e in window) / len(window)
             elapsed   = time.time() - t0
-            warmup    = " [W]" if total_steps < hp.start_steps else ""
+            warmup    = ""   # warmup is a separate phase now
             # \r overwrites the current line — 100 updates stay as one line.
             # end="" suppresses newline; flush=True forces immediate display.
             # A newline is printed only at the final episode so the last
@@ -703,7 +748,7 @@ def main():
         updates_per_episode = args.updates_per_episode,
         batch_size          = args.batch_size,
         n_envs              = args.n_envs,
-        start_steps         = args.start_steps,
+        warmup_transitions  = args.warmup_transitions,
         decay_expl_noise    = args.decay_expl_noise,
     )
 

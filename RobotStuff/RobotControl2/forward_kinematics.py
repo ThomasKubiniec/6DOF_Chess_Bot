@@ -433,16 +433,54 @@ class Robot_math:
         ee = self.give_ds()[-1]
         return -torch.linalg.vector_norm(ee).item()  # .item() gives plain Python float
 
-    def get_max_reach(self):
-        """Use L-BFGS-B to find the robot's maximum reach."""
-        x0 = torch.zeros(len(self.a)).numpy()  # scipy needs CPU numpy
-        res = minimize(fun=self._max_reach_cost,
-                       x0=x0,
-                       method="L-BFGS-B",
-                       bounds=self.joint_bounds)
-        self.q_vect  = torch.tensor(res.x, dtype=torch.float64, device=self.device)
-        self.max_reach = torch.linalg.vector_norm(self.give_ds()[-1])
-        self.q_vect  = torch.zeros(len(self.a), dtype=torch.float64, device=self.device)
+    def get_max_reach(self, n_restarts: int = 100):
+        """
+        Find the robot's maximum reach using L-BFGS-B with multiple random restarts.
+
+        A single start from the zero configuration often converges to a local
+        maximum (the home pose) rather than the true global maximum.  We run
+        n_restarts optimisations from random starting configurations and take
+        the best result.
+
+        Parameters
+        ----------
+        n_restarts : number of random starting poses to try  (default 100)
+        """
+        import numpy as np
+
+        best_reach = -1.0
+        best_q     = torch.zeros(len(self.a), dtype=torch.float64, device=self.device)
+
+        # Build numpy bounds once for scipy
+        np_bounds = self.joint_bounds   # list of (low, high) tuples
+
+        for i in range(n_restarts):
+            if i == 0:
+                # First restart: try zero configuration (original behaviour)
+                x0 = np.zeros(len(self.a))
+            else:
+                # Subsequent restarts: uniform random within joint limits
+                low  = np.array([b[0] for b in self.joint_bounds])
+                high = np.array([b[1] for b in self.joint_bounds])
+                x0   = low + (high - low) * np.random.rand(len(self.a))
+
+            res = minimize(fun=self._max_reach_cost,
+                           x0=x0,
+                           method="L-BFGS-B",
+                           bounds=np_bounds)
+
+            if res.success or res.fun < -best_reach:
+                reach = -res.fun   # cost is negative reach
+                if reach > best_reach:
+                    best_reach = reach
+                    best_q     = torch.tensor(res.x, dtype=torch.float64,
+                                              device=self.device)
+
+        self.q_vect    = best_q
+        self.max_reach = torch.tensor(best_reach, dtype=torch.float64,
+                                      device=self.device)
+        # Reset to home pose after search
+        self.q_vect = torch.zeros(len(self.a), dtype=torch.float64, device=self.device)
 
     # ------------------------------------------------------------------
     # Homogeneous Transformation for setting workspace origin
