@@ -59,7 +59,7 @@ HOW TO RUN THIS PROGRAM
    --updates_per_episode TD3 gradient steps per episode (default: 50)
    --batch_size        replay buffer sample size        (default: 2048)
    --n_envs            parallel environments K          (default: 8)
-   --start_steps       uniform random warmup steps      (default: 2000)
+   --warmup_transitions transitions to collect before training (default: 500000)
    --decay_expl_noise  flag: decay sigma over training  (default: off)
    --n_trials          Optuna trials                    (default: 50)
    --storage_path      SQLite file for Optuna study     (default: optuna_study.db)
@@ -147,7 +147,7 @@ class HParams:
     actor_lr:            float = 1e-4
     critic_lr:           float = 1e-3
     policy_delay:        int   = 2
-    hidden_width:        int   = 400
+    hidden_width:        int   = 256
     hidden_depth:        int   = 2
 
     # Exploration noise
@@ -722,7 +722,8 @@ def parse_args():
     p.add_argument("--updates_per_episode", type=int,   default=50)
     p.add_argument("--batch_size",          type=int,   default=2048)
     p.add_argument("--n_envs",              type=int,   default=8)
-    p.add_argument("--start_steps",         type=int,   default=2_000)
+    p.add_argument("--warmup_transitions",  type=int,   default=500_000,
+                   help="Fill buffer to this many transitions before training")
     p.add_argument("--decay_expl_noise",    action="store_true")
     p.add_argument("--n_trials",       type=int, default=50)
     p.add_argument("--storage_path",   type=str, default="optuna_study.db")
