@@ -462,6 +462,64 @@ class Reward_Math:
         self.passed = False
         return torch.tensor(0.0, dtype=torch.float64, device=self.device)
 
+    def r_sparse_batch(self,
+                       pos_next_batch: torch.Tensor,   # (B, 3)
+                       R_next_batch:   torch.Tensor,   # (B, 3, 3)
+                       pos_goal_batch: torch.Tensor,   # (B, 3)  or (3,)
+                       R_goal_batch:   torch.Tensor,   # (B,3,3) or (3,3)
+                       ) -> torch.Tensor:
+        """
+        Batched sparse reward for TD3 + HER training.
+
+            r = 0.0   if GOOD threshold reached  (episode success)
+            r = -1.0  otherwise                  (timestep penalty)
+
+        This is the pure sparse signal recommended by the HER literature.
+        Dense reward terms (pos, ori, vel, acc) are omitted entirely —
+        they distort HER relabelling and have been shown to reduce
+        performance relative to sparse + HER in goal-conditioned tasks.
+
+        Parameters
+        ----------
+        pos_next_batch : (B, 3)      EE position after action
+        R_next_batch   : (B, 3, 3)   EE rotation after action
+        pos_goal_batch : (B, 3) or (3,)   goal EE position
+        R_goal_batch   : (B,3,3) or (3,3) goal EE rotation
+
+        Returns
+        -------
+        r : (B,) float64 tensor of 0.0 or -1.0
+        """
+        B = pos_next_batch.shape[0]
+        dev = self.device
+
+        pos_next_batch = pos_next_batch.to(dtype=torch.float64, device=dev)
+        R_next_batch   = R_next_batch.to(dtype=torch.float64, device=dev)
+
+        if pos_goal_batch.dim() == 1:
+            pos_goal_batch = pos_goal_batch.unsqueeze(0).expand(B, -1)
+        if R_goal_batch.dim() == 2:
+            R_goal_batch = R_goal_batch.unsqueeze(0).expand(B, -1, -1)
+        pos_goal_batch = pos_goal_batch.to(dtype=torch.float64, device=dev)
+        R_goal_batch   = R_goal_batch.to(dtype=torch.float64, device=dev)
+
+        # Positional error (normalised)
+        eps       = (pos_goal_batch - pos_next_batch) / self.rob.max_reach  # (B,3)
+        e_pos_raw = torch.linalg.vector_norm(eps, dim=1)                    # (B,)
+
+        # Orientation error (Frobenius norm)
+        e_ori_raw = torch.linalg.matrix_norm(R_goal_batch - R_next_batch)  # (B,)
+
+        # Success mask — both pos and ori within GOOD thresholds
+        success = ((self.pos_w * e_pos_raw <= self._good_pos_thresh) &
+                   (self.rot_w * e_ori_raw <= self._good_ori_thresh))       # (B,) bool
+
+        # r = 0.0 on success, -1.0 otherwise
+        r = torch.where(success,
+                        torch.zeros(B, dtype=torch.float64, device=dev),
+                        -torch.ones(B, dtype=torch.float64, device=dev))
+        return r
+
     # ─────────────────────────────────────────────────────────────────────────
     # Combined reward  (single-step, called inside the environment step)
     # ─────────────────────────────────────────────────────────────────────────
