@@ -150,6 +150,12 @@ class HParams:
     hidden_width:        int   = 256
     hidden_depth:        int   = 2
 
+    # Action scale: maximum joint delta per timestep in degrees.
+    # The actor output in [-1,1] is scaled to [-max_delta_deg, +max_delta_deg].
+    # 1 degree per step with 200 steps gives 200 degrees total range per joint,
+    # sufficient to traverse the full +-90 degree workspace in one episode.
+    max_delta_deg:       float = 1.0
+
     # Exploration noise
     expl_sigma:          float = 0.1
     expl_sigma_end:      float = 0.02
@@ -196,6 +202,7 @@ def load_params(path: str, base: HParams) -> HParams:
 
 @dataclass
 class TuneConfig:
+    max_delta_deg:   bool = True
     gamma:           bool = True
     tau:             bool = True
     actor_lr:        bool = True
@@ -314,31 +321,28 @@ def vectorised_step(env:              VecEnvState,
 
     a_norm_f64 = a_norm_f32.to(dtype=torch.float64, device=device)
 
-    # ── 3. Apply actions using reward_math normalisation methods ────────────
-    # Normalise current q, add normalised delta, clamp to [-1,1], denormalise
-    q_norm     = reward_math.get_normal_joint_value(env.q_curr)            # (K,n)
-    q_new_norm = (q_norm + a_norm_f64).clamp(-1.0, 1.0)                   # (K,n)
-    q_new      = reward_math.get_original_joint_value(q_new_norm)         # (K,n)
-    # Denormalise action to real joint velocity units for reward/buffer
-    vel_low    = robot.low_bounds  - robot.high_bounds                     # (n,)
-    vel_high   = robot.high_bounds - robot.low_bounds                      # (n,)
-    delta_q    = reward_math.denormalize_from_range(
-        a_norm_f64,
-        vel_low.unsqueeze(0).expand(K, -1),
-        vel_high.unsqueeze(0).expand(K, -1))                               # (K,n)
+    # ── 3. Apply actions — scaled to +-max_delta_deg per joint per step ────
+    # a_norm_f64 is in [-1, 1].  Scale to radians then add to current q.
+    # Clamp the resulting joint angle to joint limits.
+    max_delta_rad = torch.tensor(
+        hp.max_delta_deg * (3.14159265358979 / 180.0),
+        dtype=torch.float64, device=device)
+    delta_q   = a_norm_f64 * max_delta_rad                                 # (K,n)
+    q_new     = (env.q_curr + delta_q).clamp(
+        robot.low_bounds.unsqueeze(0),
+        robot.high_bounds.unsqueeze(0))                                    # (K,n)
 
     # ── 4. Batched FK ─────────────────────────────────────────────────────
     pos_next, R_next = batch_ee_pose(robot, q_new)                         # (K,3),(K,3,3)
 
-    # ── 5. Batched reward ─────────────────────────────────────────────────
-    r_batch, _ = reward_math.reward_batch(
-        pos_curr_batch     = env.pos_curr,
-        R_curr_SO3_batch   = env.R_curr,
-        delta_q_new_batch  = delta_q,
-        delta_q_prev_batch = env.delta_q_prev,
-        pos_goal_batch     = env.pos_goal,
-        R_goal_SO3_batch   = env.R_goal,
-        use_focal          = True,
+    # ── 5. Sparse reward: 0.0 on success, -1.0 otherwise ─────────────────
+    # Dense reward terms (pos, ori, vel, acc) are omitted — they distort
+    # HER relabelling and reduce performance vs sparse+HER per literature.
+    r_batch = reward_math.r_sparse_batch(
+        pos_next_batch = pos_next,
+        R_next_batch   = R_next,
+        pos_goal_batch = env.pos_goal,
+        R_goal_batch   = env.R_goal,
     )                                                                       # (K,)
 
     # ── 6. Optional collision check (sequential) ──────────────────────────
@@ -365,25 +369,28 @@ def vectorised_step(env:              VecEnvState,
     env.ep_reward += r_batch
 
     # ── 8. Cache steps; commit and reset finished environments ────────────
+    # Tensors stay on GPU throughout — no .cpu() calls here.
+    # finish_episode receives GPU tensors and operates on rm.device directly.
+    # Only Python scalars (done flag, log values) are pulled to CPU.
     for k in range(K):
-        done = done_k[k].item()
+        done = done_k[k].item()   # scalar bool — cheap
         env.caches[k].append({
-            "q_new":        q_new[k].cpu(),
-            "delta_q_new":  delta_q[k].cpu(),
-            "delta_q_prev": env.delta_q_prev[k].cpu(),
-            "pos_curr":     env.pos_curr[k].cpu(),
-            "R_curr":       env.R_curr[k].cpu(),
-            "pos_next":     pos_next[k].cpu(),
-            "R_next":       R_next[k].cpu(),
-            "a_norm":       a_norm_f64[k].cpu(),
-            "done":         float(done),
+            "q_new":        q_new[k],               # GPU float64
+            "delta_q_new":  delta_q[k],             # GPU float64
+            "delta_q_prev": env.delta_q_prev[k],    # GPU float64
+            "pos_curr":     env.pos_curr[k],        # GPU float64
+            "R_curr":       env.R_curr[k],          # GPU float64
+            "pos_next":     pos_next[k],            # GPU float64
+            "R_next":       R_next[k],              # GPU float64
+            "a_norm":       a_norm_f64[k],          # GPU float64
+            "done":         float(done),            # Python scalar
         })
 
         if done:
             buffer._episode_cache = env.caches[k]
             buffer.finish_episode(
-                pos_goal   = env.pos_goal[k].cpu(),
-                R_goal_SO3 = env.R_goal[k].cpu(),
+                pos_goal   = env.pos_goal[k],       # GPU float64 — no .cpu()
+                R_goal_SO3 = env.R_goal[k],         # GPU float64 — no .cpu()
             )
             grade = ("GOOD" if success_k[k] else
                      "CRASH" if crashed_k[k] else "FAIL")
@@ -620,6 +627,7 @@ def suggest_hparams(trial: optuna.Trial,
                     base:  HParams,
                     flags: TuneConfig) -> HParams:
     hp = copy.deepcopy(base)
+    if flags.max_delta_deg:   hp.max_delta_deg   = trial.suggest_float("max_delta_deg", 0.5, 5.0)
     if flags.gamma:           hp.gamma           = trial.suggest_float("gamma", 0.95, 0.999)
     if flags.tau:             hp.tau             = trial.suggest_float("tau", 1e-3, 1e-1, log=True)
     if flags.actor_lr:        hp.actor_lr        = trial.suggest_float("actor_lr", 1e-5, 1e-3, log=True)
@@ -724,14 +732,16 @@ def parse_args():
     p.add_argument("--n_envs",              type=int,   default=8)
     p.add_argument("--warmup_transitions",  type=int,   default=500_000,
                    help="Fill buffer to this many transitions before training")
+    p.add_argument("--max_delta_deg",        type=float, default=1.0,
+                   help="Max joint delta per step in degrees (action scale)")
     p.add_argument("--decay_expl_noise",    action="store_true")
     p.add_argument("--n_trials",       type=int, default=50)
     p.add_argument("--storage_path",   type=str, default="optuna_study.db")
     p.add_argument("--dashboard_port", type=int, default=8080)
 
-    tuneable = ["gamma", "tau", "actor_lr", "critic_lr", "hidden_width",
-                "hidden_depth", "n_envs", "pos_w", "rot_w", "vel_lambda",
-                "acc_lambda", "her_ratio_start", "her_decay_steps",
+    tuneable = ["max_delta_deg", "gamma", "tau", "actor_lr", "critic_lr",
+                "hidden_width", "hidden_depth", "n_envs", "pos_w", "rot_w",
+                "vel_lambda", "acc_lambda", "her_ratio_start", "her_decay_steps",
                 "expl_sigma", "expl_sigma_end", "target_sigma"]
     for name in tuneable:
         p.add_argument(f"--no_tune_{name}", action="store_true",
@@ -750,6 +760,7 @@ def main():
         batch_size          = args.batch_size,
         n_envs              = args.n_envs,
         warmup_transitions  = args.warmup_transitions,
+        max_delta_deg       = args.max_delta_deg,
         decay_expl_noise    = args.decay_expl_noise,
     )
 
@@ -759,9 +770,9 @@ def main():
 
     # Build TuneConfig
     tc = TuneConfig()
-    tuneable = ["gamma", "tau", "actor_lr", "critic_lr", "hidden_width",
-                "hidden_depth", "n_envs", "pos_w", "rot_w", "vel_lambda",
-                "acc_lambda", "her_ratio_start", "her_decay_steps",
+    tuneable = ["max_delta_deg", "gamma", "tau", "actor_lr", "critic_lr",
+                "hidden_width", "hidden_depth", "n_envs", "pos_w", "rot_w",
+                "vel_lambda", "acc_lambda", "her_ratio_start", "her_decay_steps",
                 "expl_sigma", "expl_sigma_end", "target_sigma"]
     for name in tuneable:
         if getattr(args, f"no_tune_{name}", False):

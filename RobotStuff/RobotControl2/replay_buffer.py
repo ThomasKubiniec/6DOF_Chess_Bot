@@ -104,15 +104,17 @@ class Replay_Buffer:
                  a_norm:       torch.Tensor,
                  done:         bool):
         """Cache one environment step.  Call finish_episode() at episode end."""
+        # Store tensors as-is (GPU float64 from vectorised_step).
+        # _cpu64 conversion removed — tensors stay on GPU throughout.
         self._episode_cache.append({
-            "q_new":        _cpu64(q_new),
-            "delta_q_new":  _cpu64(delta_q_new),
-            "delta_q_prev": _cpu64(delta_q_prev),
-            "pos_curr":     _cpu64(pos_curr),
-            "R_curr":       _cpu64(R_curr),
-            "pos_next":     _cpu64(pos_next),
-            "R_next":       _cpu64(R_next),
-            "a_norm":       _cpu64(a_norm),
+            "q_new":        q_new,
+            "delta_q_new":  delta_q_new,
+            "delta_q_prev": delta_q_prev,
+            "pos_curr":     pos_curr,
+            "R_curr":       R_curr,
+            "pos_next":     pos_next,
+            "R_next":       R_next,
+            "a_norm":       a_norm,
             "done":         float(done),
         })
 
@@ -146,22 +148,23 @@ class Replay_Buffer:
         rm    = self.rm
         ratio = self.her_ratio
 
-        # ── Stack episode cache and move to rm.device ────────────────────
-        # Cache entries are CPU float64. All reward_batch / build_state_batch
-        # calls operate on rm.device (CUDA when training on GPU), so we cast
-        # once here to avoid cross-device errors inside those calls.
+        # ── Stack episode cache ───────────────────────────────────────────
+        # Cache entries are GPU float64 tensors (no .cpu() in vectorised_step).
+        # torch.stack on GPU tensors produces a GPU tensor directly —
+        # no CPU->GPU transfer needed here.
         dev = rm.device
-        pos_curr_T     = torch.stack([c["pos_curr"]     for c in cache]).to(dev)  # (T, 3)
-        pos_next_T     = torch.stack([c["pos_next"]     for c in cache]).to(dev)  # (T, 3)
-        R_curr_T       = torch.stack([c["R_curr"]       for c in cache]).to(dev)  # (T, 3, 3)
-        R_next_T       = torch.stack([c["R_next"]       for c in cache]).to(dev)  # (T, 3, 3)
-        delta_q_new_T  = torch.stack([c["delta_q_new"]  for c in cache]).to(dev)  # (T, n)
-        delta_q_prev_T = torch.stack([c["delta_q_prev"] for c in cache]).to(dev)  # (T, n)
-        a_norm_T       = torch.stack([c["a_norm"]       for c in cache]).to(dev)  # (T, n)
+        pos_curr_T     = torch.stack([c["pos_curr"]     for c in cache])  # (T, 3)
+        pos_next_T     = torch.stack([c["pos_next"]     for c in cache])  # (T, 3)
+        R_curr_T       = torch.stack([c["R_curr"]       for c in cache])  # (T, 3, 3)
+        R_next_T       = torch.stack([c["R_next"]       for c in cache])  # (T, 3, 3)
+        delta_q_new_T  = torch.stack([c["delta_q_new"]  for c in cache])  # (T, n)
+        delta_q_prev_T = torch.stack([c["delta_q_prev"] for c in cache])  # (T, n)
+        a_norm_T       = torch.stack([c["a_norm"]       for c in cache])  # (T, n)
         done_T         = torch.tensor([c["done"] for c in cache],
-                                      dtype=torch.float32, device=dev)            # (T,)
-        pos_goal   = _cpu64(pos_goal).to(dev)
-        R_goal_SO3 = _cpu64(R_goal_SO3).to(dev)
+                                      dtype=torch.float32, device=dev)    # (T,)
+        # pos_goal and R_goal_SO3 arrive as GPU tensors from vectorised_step
+        pos_goal   = pos_goal.to(dtype=torch.float64)
+        R_goal_SO3 = R_goal_SO3.to(dtype=torch.float64)
 
         # ── Real transitions ────────────────────────────────────────────────
         # State at t: uses pos_curr[t] and delta_q_prev[t]
@@ -180,15 +183,13 @@ class Replay_Buffer:
             delta_q_prev_batch = delta_q_new_T,
         )                                                    # (T, S)
 
-        # Rewards: reward_batch uses pos_next as "current" after the step
-        r_T, _ = rm.reward_batch(
-            pos_curr_batch     = pos_next_T,
-            R_curr_SO3_batch   = R_next_T,
-            delta_q_new_batch  = delta_q_new_T,
-            delta_q_prev_batch = delta_q_prev_T,
-            pos_goal_batch     = pos_goal.unsqueeze(0).expand(T, -1),
-            R_goal_SO3_batch   = R_goal_SO3.unsqueeze(0).expand(T, -1, -1),
-            use_focal          = use_focal,
+        # Sparse reward: 0.0 on success, -1.0 otherwise.
+        # Dense terms omitted — they distort HER relabelling (see literature).
+        r_T = rm.r_sparse_batch(
+            pos_next_batch = pos_next_T,
+            R_next_batch   = R_next_T,
+            pos_goal_batch = pos_goal,
+            R_goal_batch   = R_goal_SO3,
         )                                                    # (T,)
 
         self._write_batch(s_T, a_norm_T, r_T, sp_T, done_T)
@@ -236,14 +237,14 @@ class Replay_Buffer:
                     delta_q_prev_batch = delta_q_new_T[t_idx],
                 )                                            # (M, S)
 
-                r_her, _ = rm.reward_batch(
-                    pos_curr_batch     = pos_next_T[t_idx],
-                    R_curr_SO3_batch   = R_next_T[t_idx],
-                    delta_q_new_batch  = delta_q_new_T[t_idx],
-                    delta_q_prev_batch = delta_q_prev_T[t_idx],
-                    pos_goal_batch     = her_pos_goal,
-                    R_goal_SO3_batch   = her_R_goal,
-                    use_focal          = use_focal,
+                # HER sparse reward: the relabelled terminal step achieves
+                # her_pos_goal by construction, so it gets r=0.  All prior
+                # steps in the HER trajectory get r=-1.
+                r_her = rm.r_sparse_batch(
+                    pos_next_batch = pos_next_T[t_idx],
+                    R_next_batch   = R_next_T[t_idx],
+                    pos_goal_batch = her_pos_goal,
+                    R_goal_batch   = her_R_goal,
                 )                                            # (M,)
 
                 self._write_batch(s_her, a_norm_T[t_idx],
